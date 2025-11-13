@@ -18,6 +18,7 @@
 (require 'recentf)
 (require 'url)
 (require 'nerd-icons)
+(require 'cl-lib)
 
 ;;; Code:
 
@@ -26,6 +27,12 @@
 (defvar panel-temperature nil)
 (defvar panel-weatherdescription nil)
 (defvar panel-weathericon nil)
+
+(defvar panel--weather-timer nil
+  "Timer for periodic weather updates.")
+
+(defvar panel--weather-fetch-in-progress nil
+  "Flag to prevent concurrent weather fetches.")
 
 (defcustom panel-title "Quick access [C-number to open file]"
   "Panel title."
@@ -308,29 +315,56 @@
 
 (defun panel--fetch-weather-data (&optional initial)
   "Fetch weather data from API. INITIAL indicates if this is the first fetch."
+  (when panel--weather-fetch-in-progress
+    (message "Panel: Weather fetch already in progress, skipping...")
+    (cl-return-from panel--fetch-weather-data))
+
+  (setq panel--weather-fetch-in-progress t)
+
   (let ((url-request-method "GET")
         (url-request-extra-headers '(("Content-Type" . "application/json")))
         (url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
                      panel-latitude panel-longitude)))
     (url-retrieve url
-                  (lambda (_)
-                    (goto-char (point-min))
-                    (re-search-forward "^$")
-                    (let* ((json-data (buffer-substring-no-properties (point) (point-max)))
-                           (json-obj (json-read-from-string json-data)))
-                      (let-alist json-obj
-                        (setq panel-temperature (format "%.1f" .current_weather.temperature))
-                        (setq panel-weatherdescription
-                              (format "%s" (panel--weather-code-to-string .current_weather.weathercode)))
-                        (setq panel-weathericon
-                              (panel--weather-icon-from-code .current_weather.weathercode)))
-                      ;; Only set up the recurring timer after initial fetch
-                      (when initial
-                        (run-with-timer 900 900 #'panel--fetch-weather-data))
-                      (when (panel--is-active)
-                        (panel--refresh-screen))))
+                  (lambda (status)
+                    (setq panel--weather-fetch-in-progress nil)
+                    (when (plist-get status :error)
+                      (message "Panel: Weather fetch error: %s" (plist-get status :error))
+                      (cl-return-from lambda))
+                    (condition-case err
+                        (progn
+                          (goto-char (point-min))
+                          (re-search-forward "^$")
+                          (let* ((json-data (buffer-substring-no-properties (point) (point-max)))
+                                 (json-obj (json-read-from-string json-data)))
+                            (let-alist json-obj
+                              (setq panel-temperature (format "%.1f" .current_weather.temperature))
+                              (setq panel-weatherdescription
+                                    (format "%s" (panel--weather-code-to-string .current_weather.weathercode)))
+                              (setq panel-weathericon
+                                    (panel--weather-icon-from-code .current_weather.weathercode)))
+                            (when (and initial (not panel--weather-timer))
+                              (setq panel--weather-timer
+                                    (run-with-timer 900 900 #'panel--fetch-weather-data)))
+                            (when (panel--is-active)
+                              (panel--refresh-screen))))
+                      (error
+                       (message "Panel: Error parsing weather data: %s" err))))
                   nil
                   t)))
+
+(defun panel--cleanup-weather ()
+  "Cancel weather timer and reset state."
+  (when panel--weather-timer
+    (cancel-timer panel--weather-timer)
+    (setq panel--weather-timer nil))
+  (setq panel--weather-fetch-in-progress nil))
+
+(defun panel--init-weather ()
+  "Initialize weather fetching with cleanup."
+  (panel--cleanup-weather)
+  (when (panel--show-weather-info)
+    (panel--fetch-weather-data t)))
 
 ;;;###autoload
 (defun panel-create-hook ()
@@ -340,8 +374,7 @@
     (add-hook 'window-configuration-change-hook #'panel--redisplay-buffer-on-resize)
     (add-hook 'emacs-startup-hook (lambda ()
                                     (panel--refresh-screen)
-                                    (when (panel--show-weather-info)
-                                      (run-with-idle-timer 0.1 nil #'panel--fetch-weather-data t))))))
+                                    (run-with-idle-timer 0.1 nil #'panel--init-weather)))))
 
 (defun panel--truncate-text-right (text)
   "Truncate TEXT at the right to a maximum of 100 characters."
