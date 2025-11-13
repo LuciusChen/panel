@@ -315,43 +315,49 @@
 
 (defun panel--fetch-weather-data (&optional initial)
   "Fetch weather data from API. INITIAL indicates if this is the first fetch."
-  (when panel--weather-fetch-in-progress
-    (message "Panel: Weather fetch already in progress, skipping...")
-    (cl-return-from panel--fetch-weather-data))
+  (unless panel--weather-fetch-in-progress
+    (setq panel--weather-fetch-in-progress t)
 
-  (setq panel--weather-fetch-in-progress t)
-
-  (let ((url-request-method "GET")
-        (url-request-extra-headers '(("Content-Type" . "application/json")))
-        (url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
-                     panel-latitude panel-longitude)))
-    (url-retrieve url
-                  (lambda (status)
-                    (setq panel--weather-fetch-in-progress nil)
-                    (when (plist-get status :error)
-                      (message "Panel: Weather fetch error: %s" (plist-get status :error))
-                      (cl-return-from lambda))
-                    (condition-case err
-                        (progn
-                          (goto-char (point-min))
-                          (re-search-forward "^$")
-                          (let* ((json-data (buffer-substring-no-properties (point) (point-max)))
-                                 (json-obj (json-read-from-string json-data)))
-                            (let-alist json-obj
-                              (setq panel-temperature (format "%.1f" .current_weather.temperature))
-                              (setq panel-weatherdescription
-                                    (format "%s" (panel--weather-code-to-string .current_weather.weathercode)))
-                              (setq panel-weathericon
-                                    (panel--weather-icon-from-code .current_weather.weathercode)))
-                            (when (and initial (not panel--weather-timer))
-                              (setq panel--weather-timer
-                                    (run-with-timer 900 900 #'panel--fetch-weather-data)))
-                            (when (panel--is-active)
-                              (panel--refresh-screen))))
-                      (error
-                       (message "Panel: Error parsing weather data: %s" err))))
-                  nil
-                  t)))
+    (let ((url-request-method "GET")
+          (url-request-extra-headers '(("Content-Type" . "application/json")))
+          (url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
+                       panel-latitude panel-longitude)))
+      (url-retrieve url
+                    (lambda (status)
+                      (setq panel--weather-fetch-in-progress nil)
+                      (unless (plist-get status :error)
+                        (condition-case err
+                            (progn
+                              (goto-char (point-min))
+                              (when (and (re-search-forward "^HTTP/[0-9\\.]+ \\([0-9]+\\)" nil t)
+                                         (= 200 (string-to-number (match-string 1))))
+                                (goto-char (point-min))
+                                (when (re-search-forward "^$" nil t)
+                                  (forward-char 1)
+                                  (let* ((json-string (buffer-substring-no-properties (point) (point-max))))
+                                    (unless (string-empty-p (string-trim json-string))
+                                      (let ((json-obj (json-read-from-string json-string)))
+                                        (let-alist json-obj
+                                          (when (and .current_weather
+                                                     .current_weather.temperature
+                                                     .current_weather.weathercode)
+                                            (setq panel-temperature
+                                                  (format "%.1f" .current_weather.temperature))
+                                            (setq panel-weatherdescription
+                                                  (panel--weather-code-to-string .current_weather.weathercode))
+                                            (setq panel-weathericon
+                                                  (panel--weather-icon-from-code .current_weather.weathercode))
+                                            (when (and initial (not panel--weather-timer))
+                                              (setq panel--weather-timer
+                                                    (run-with-timer 900 900 #'panel--fetch-weather-data)))
+                                            (when (panel--is-active)
+                                              (panel--refresh-screen))))))))))
+                          (json-end-of-file
+                           (message "Panel: Incomplete JSON data"))
+                          (error
+                           (message "Panel: Weather error: %s" err)))))
+                    nil
+                    t))))
 
 (defun panel--cleanup-weather ()
   "Cancel weather timer and reset state."
