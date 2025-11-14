@@ -5,7 +5,7 @@
 ;; Author: Mikael Konradsson <mikael.konradsson@outlook.com>
 ;; Maintainer: Mikael Konradsson <mikael.konradsson@outlook.com>
 ;; Created: 2023
-;; Version: 0.1
+;; Version: 0.2
 ;; Package-Requires: ((emacs "27.1") (async "1.9.7"))
 ;; Homepage: https://github.com/konrad1977/welcome-panel
 
@@ -18,7 +18,6 @@
 (require 'recentf)
 (require 'url)
 (require 'nerd-icons)
-(require 'cl-lib)
 
 ;;; Code:
 
@@ -33,6 +32,18 @@
 
 (defvar panel--weather-fetch-in-progress nil
   "Flag to prevent concurrent weather fetches.")
+
+(defvar panel--resize-timer nil
+  "Timer for debouncing resize events.")
+
+(defvar panel--last-weather-update nil
+  "Timestamp of last successful weather update.")
+
+(defvar panel--weather-retry-count 0
+  "Number of retry attempts for weather fetch.")
+
+(defvar panel--cached-image nil
+  "Cached image object.")
 
 (defcustom panel-title "Quick access [C-number to open file]"
   "Panel title."
@@ -79,6 +90,21 @@
   :group 'panel
   :type 'natnum)
 
+(defcustom panel-weather-update-interval 900
+  "Interval in seconds between weather updates."
+  :group 'panel
+  :type 'integer)
+
+(defcustom panel-weather-cache-duration 900
+  "Weather cache duration in seconds."
+  :group 'panel
+  :type 'integer)
+
+(defcustom panel-weather-max-retries 3
+  "Maximum number of retry attempts for weather fetch."
+  :group 'panel
+  :type 'integer)
+
 (defgroup panel nil
   "Panel group."
   :group 'applications)
@@ -97,11 +123,18 @@
 
 (defvar panel-mode-map
   (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+
     (define-key map (kbd "RET") 'panel--open-recent-file)
     (define-key map (kbd "o") 'panel--open-recent-file)
+    (define-key map (kbd "g") 'panel-refresh)
+    (define-key map (kbd "r") 'panel-refresh)
 
-    ;; Add shortcuts for file indexes
     (dolist (i (number-sequence 1 9))
+      (define-key map (kbd (number-to-string i))
+                  `(lambda ()
+                     (interactive)
+                     (panel--open-recent-file-at-index ,i)))
       (define-key map (kbd (concat "M-s-" (number-to-string i)))
                   `(lambda ()
                      (interactive)
@@ -120,8 +153,7 @@
   (setq-local truncate-lines t)
   (setq-local mode-line-format nil)
   (setq-local global-hl-line-mode nil)
-  (setq-local buffer-read-only t)
-  (use-local-map panel-mode-map))
+  (setq cursor-type nil))
 
 (defface panel-title-face
   '((t :inherit font-lock-constant-face :height 1.3 :italic t))
@@ -309,13 +341,44 @@
     (insert (format "%s%s\n" (make-string left-margin ?\s) text))))
 
 (defun panel--redisplay-buffer-on-resize (&rest _)
-  "Resize current buffer."
+  "Resize current buffer with debouncing."
   (when (equal (buffer-name) panel-buffer)
-    (panel--refresh-screen)))
+    (when panel--resize-timer
+      (cancel-timer panel--resize-timer))
+    (setq panel--resize-timer
+          (run-with-idle-timer 0.2 nil
+                               (lambda ()
+                                 (when (get-buffer-window panel-buffer)
+                                   (panel--refresh-screen)))))))
 
-(defun panel--fetch-weather-data (&optional initial)
-  "Fetch weather data from API. INITIAL indicates if this is the first fetch."
-  (unless panel--weather-fetch-in-progress
+(defun panel--weather-cache-valid-p ()
+  "Check if weather cache is still valid."
+  (and panel--last-weather-update
+       panel-temperature
+       (< (- (float-time) panel--last-weather-update)
+          panel-weather-cache-duration)))
+
+(defun panel--get-image ()
+  "Get or create cached image."
+  (when (and (file-exists-p panel-image-file)
+             (not (string-empty-p panel-image-file)))
+    (unless (and panel--cached-image
+                 (equal panel-image-file (plist-get (cdr panel--cached-image) :file)))
+      (setq panel--cached-image
+            (create-image panel-image-file 'png nil
+                          :width panel-image-width
+                          :height panel-image-height)))
+    panel--cached-image))
+
+(defun panel--fetch-weather-data (&optional initial force)
+  "Fetch weather data from API.
+INITIAL indicates if this is the first fetch.
+FORCE bypasses cache check."
+  (when (and (not initial) (not force) (panel--weather-cache-valid-p))
+    (message "Panel: Using cached weather data"))
+
+  (unless (or panel--weather-fetch-in-progress
+              (and (not initial) (not force) (panel--weather-cache-valid-p)))
     (setq panel--weather-fetch-in-progress t)
 
     (let ((url-request-method "GET")
@@ -325,7 +388,17 @@
       (url-retrieve url
                     (lambda (status)
                       (setq panel--weather-fetch-in-progress nil)
-                      (unless (plist-get status :error)
+                      (if (plist-get status :error)
+                          (progn
+                            (message "Panel: Weather error (attempt %d/%d): %s"
+                                     (1+ panel--weather-retry-count)
+                                     panel-weather-max-retries
+                                     (plist-get status :error))
+                            (when (< panel--weather-retry-count panel-weather-max-retries)
+                              (setq panel--weather-retry-count (1+ panel--weather-retry-count))
+                              (run-with-timer (* 30 panel--weather-retry-count) nil
+                                              #'panel--fetch-weather-data initial force)))
+                        (setq panel--weather-retry-count 0)
                         (condition-case err
                             (progn
                               (goto-char (point-min))
@@ -347,30 +420,64 @@
                                                   (panel--weather-code-to-string .current_weather.weathercode))
                                             (setq panel-weathericon
                                                   (panel--weather-icon-from-code .current_weather.weathercode))
+                                            (setq panel--last-weather-update (float-time))
                                             (when (and initial (not panel--weather-timer))
                                               (setq panel--weather-timer
-                                                    (run-with-timer 900 900 #'panel--fetch-weather-data)))
+                                                    (run-with-timer panel-weather-update-interval
+                                                                    panel-weather-update-interval
+                                                                    #'panel--fetch-weather-data)))
                                             (when (panel--is-active)
-                                              (panel--refresh-screen))))))))))
+                                              (panel--refresh-weather-only))))))))))
+
                           (json-end-of-file
                            (message "Panel: Incomplete JSON data"))
                           (error
-                           (message "Panel: Weather error: %s" err)))))
+                           (message "Panel: Weather parse error: %s" err)))))
                     nil
                     t))))
+
+(defun panel--refresh-weather-only ()
+  "Only refresh weather information without redrawing entire screen."
+  (when (get-buffer panel-buffer)
+    (with-current-buffer panel-buffer
+      (let ((inhibit-read-only t)
+            (pos (point)))
+        (save-excursion
+          (goto-char (point-min))
+          (when (re-search-forward "Loading weather\\|Clear sky\\|Partly cloudy\\|Fog\\|Drizzle\\|Rain\\|Snow\\|Thunderstorm" nil t)
+            (beginning-of-line)
+            (let ((line-start (point)))
+              (forward-line 1)
+              (delete-region line-start (point))
+              (goto-char line-start)
+              (panel--insert-weather-info))))
+        (goto-char pos)))))
 
 (defun panel--cleanup-weather ()
   "Cancel weather timer and reset state."
   (when panel--weather-timer
     (cancel-timer panel--weather-timer)
     (setq panel--weather-timer nil))
-  (setq panel--weather-fetch-in-progress nil))
+  (when panel--resize-timer
+    (cancel-timer panel--resize-timer)
+    (setq panel--resize-timer nil))
+  (setq panel--weather-fetch-in-progress nil)
+  (setq panel--last-weather-update nil)
+  (setq panel--weather-retry-count 0)
+  (setq panel--cached-image nil))
 
 (defun panel--init-weather ()
   "Initialize weather fetching with cleanup."
   (panel--cleanup-weather)
   (when (panel--show-weather-info)
     (panel--fetch-weather-data t)))
+
+(defun panel-refresh ()
+  "Manually refresh the panel and weather."
+  (interactive)
+  (panel--refresh-screen)
+  (when (panel--show-weather-info)
+    (panel--fetch-weather-data nil t)))
 
 ;;;###autoload
 (defun panel-create-hook ()
@@ -434,8 +541,8 @@
 
 (defun panel--is-active ()
   "Check if buffer is active and visible."
-  (or (eq panel-buffer (window-buffer (selected-window)))
-      (get-buffer-window panel-buffer 'visible)))
+  (and (buffer-live-p (get-buffer panel-buffer))
+       (get-buffer-window panel-buffer 'visible)))
 
 (defun panel--refresh-screen ()
   "Show the panel screen."
@@ -443,10 +550,12 @@
   (set-face-background 'fringe (face-attribute 'default :background))
   (with-current-buffer (get-buffer-create panel-buffer)
     (let* ((buffer-read-only)
-           (image (create-image panel-image-file 'png nil :width panel-image-width :height panel-image-height))
-           (size (image-size image))
-           (width (car size))
-           (left-margin (max panel-min-left-padding (floor (/ (- (window-width) width) 2))))
+           (image (panel--get-image))
+           (size (when image (image-size image)))
+           (width (when size (car size)))
+           (left-margin (if width
+                            (max panel-min-left-padding (floor (/ (- (window-width) width) 2)))
+                          panel-min-left-padding))
            (packages (format "%d" (panel--package-length))))
       (erase-buffer)
       (goto-char (point-min))
@@ -465,9 +574,10 @@
         (insert "\n")
         (panel--insert-centered (propertize (format-time-string "%A, %B %d %R") 'face 'panel-time-face))
 
-        (insert "\n\n")
-        (insert (make-string left-margin ?\ ))
-        (insert-image image)
+        (when image
+          (insert "\n\n")
+          (insert (make-string left-margin ?\ ))
+          (insert-image image))
 
         (switch-to-buffer panel-buffer)
         (panel-mode)
