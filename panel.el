@@ -549,7 +549,6 @@ FORCE bypasses cache check."
 (defun panel--refresh-screen ()
   "Show the panel screen."
   (setq panel-recentfiles (seq-take recentf-list 9))
-  (set-face-background 'fringe (face-attribute 'default :background))
   (with-current-buffer (get-buffer-create panel-buffer)
     (let* ((buffer-read-only)
            (image (panel--get-image))
