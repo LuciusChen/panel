@@ -374,18 +374,20 @@
   "Fetch weather data from API.
 INITIAL indicates if this is the first fetch.
 FORCE bypasses cache check."
-  (when (and (not initial) (not force) (panel--weather-cache-valid-p))
-    (message "Panel: Using cached weather data"))
+  ;; Skip fetch if panel is not visible (unless it's initial setup or forced)
+  (when (or initial force (panel--is-active))
+    (when (and (not initial) (not force) (panel--weather-cache-valid-p))
+      (message "Panel: Using cached weather data"))
 
-  (unless (or panel--weather-fetch-in-progress
-              (and (not initial) (not force) (panel--weather-cache-valid-p)))
-    (setq panel--weather-fetch-in-progress t)
+    (unless (or panel--weather-fetch-in-progress
+                (and (not initial) (not force) (panel--weather-cache-valid-p)))
+      (setq panel--weather-fetch-in-progress t)
 
-    (let ((url-request-method "GET")
-          (url-request-extra-headers '(("Content-Type" . "application/json")))
-          (url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
-                       panel-latitude panel-longitude)))
-      (url-retrieve url
+      (let ((url-request-method "GET")
+            (url-request-extra-headers '(("Content-Type" . "application/json")))
+            (url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
+                         panel-latitude panel-longitude)))
+        (url-retrieve url
                     (lambda (status)
                       (setq panel--weather-fetch-in-progress nil)
                       (if (plist-get status :error)
@@ -434,7 +436,7 @@ FORCE bypasses cache check."
                           (error
                            (message "Panel: Weather parse error: %s" err)))))
                     nil
-                    t))))
+                    t)))))
 
 (defun panel--refresh-weather-only ()
   "Only refresh weather information without redrawing entire screen."
