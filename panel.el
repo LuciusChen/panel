@@ -6,7 +6,7 @@
 ;; Maintainer: Mikael Konradsson <mikael.konradsson@outlook.com>
 ;; Created: 2023
 ;; Version: 0.2
-;; Package-Requires: ((emacs "27.1") (async "1.9.7"))
+;; Package-Requires: ((emacs "27.1") (async "1.9.7") (plz "0.7"))
 ;; Homepage: https://github.com/konrad1977/welcome-panel
 
 ;;; Commentary:
@@ -16,7 +16,7 @@
 (require 'async)
 (require 'json)
 (require 'recentf)
-(require 'url)
+(require 'plz)
 (require 'nerd-icons)
 
 ;;; Code:
@@ -374,7 +374,6 @@
   "Fetch weather data from API.
 INITIAL indicates if this is the first fetch.
 FORCE bypasses cache check."
-  ;; Skip fetch if panel is not visible (unless it's initial setup or forced)
   (when (or initial force (panel--is-active))
     (when (and (not initial) (not force) (panel--weather-cache-valid-p))
       (message "Panel: Using cached weather data"))
@@ -383,60 +382,44 @@ FORCE bypasses cache check."
                 (and (not initial) (not force) (panel--weather-cache-valid-p)))
       (setq panel--weather-fetch-in-progress t)
 
-      (let ((url-request-method "GET")
-            (url-request-extra-headers '(("Content-Type" . "application/json")))
-            (url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
+      (let ((url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
                          panel-latitude panel-longitude)))
-        (url-retrieve url
-                    (lambda (status)
-                      (setq panel--weather-fetch-in-progress nil)
-                      (if (plist-get status :error)
-                          (progn
-                            (message "Panel: Weather error (attempt %d/%d): %s"
-                                     (1+ panel--weather-retry-count)
-                                     panel-weather-max-retries
-                                     (plist-get status :error))
-                            (when (< panel--weather-retry-count panel-weather-max-retries)
-                              (setq panel--weather-retry-count (1+ panel--weather-retry-count))
-                              (run-with-timer (* 30 panel--weather-retry-count) nil
-                                              #'panel--fetch-weather-data initial force)))
-                        (setq panel--weather-retry-count 0)
-                        (condition-case err
-                            (progn
-                              (goto-char (point-min))
-                              (when (and (re-search-forward "^HTTP/[0-9\\.]+ \\([0-9]+\\)" nil t)
-                                         (= 200 (string-to-number (match-string 1))))
-                                (goto-char (point-min))
-                                (when (re-search-forward "^$" nil t)
-                                  (forward-char 1)
-                                  (let* ((json-string (buffer-substring-no-properties (point) (point-max))))
-                                    (unless (string-empty-p (string-trim json-string))
-                                      (let ((json-obj (json-read-from-string json-string)))
-                                        (let-alist json-obj
-                                          (when (and .current_weather
-                                                     .current_weather.temperature
-                                                     .current_weather.weathercode)
-                                            (setq panel-temperature
-                                                  (format "%.1f" .current_weather.temperature))
-                                            (setq panel-weatherdescription
-                                                  (panel--weather-code-to-string .current_weather.weathercode))
-                                            (setq panel-weathericon
-                                                  (panel--weather-icon-from-code .current_weather.weathercode))
-                                            (setq panel--last-weather-update (float-time))
-                                            (when (and initial (not panel--weather-timer))
-                                              (setq panel--weather-timer
-                                                    (run-with-timer panel-weather-update-interval
-                                                                    panel-weather-update-interval
-                                                                    #'panel--fetch-weather-data)))
-                                            (when (panel--is-active)
-                                              (panel--refresh-weather-only))))))))))
-
-                          (json-end-of-file
-                           (message "Panel: Incomplete JSON data"))
-                          (error
-                           (message "Panel: Weather parse error: %s" err)))))
-                    nil
-                    t)))))
+        (plz 'get url
+          :as #'json-read
+          :then (lambda (json-obj)
+                  (setq panel--weather-fetch-in-progress nil)
+                  (setq panel--weather-retry-count 0)
+                  (condition-case err
+                      (let-alist json-obj
+                        (when (and .current_weather
+                                   .current_weather.temperature
+                                   .current_weather.weathercode)
+                          (setq panel-temperature
+                                (format "%.1f" .current_weather.temperature))
+                          (setq panel-weatherdescription
+                                (panel--weather-code-to-string .current_weather.weathercode))
+                          (setq panel-weathericon
+                                (panel--weather-icon-from-code .current_weather.weathercode))
+                          (setq panel--last-weather-update (float-time))
+                          (when (and initial (not panel--weather-timer))
+                            (setq panel--weather-timer
+                                  (run-with-timer panel-weather-update-interval
+                                                  panel-weather-update-interval
+                                                  #'panel--fetch-weather-data)))
+                          (when (panel--is-active)
+                            (panel--refresh-weather-only))))
+                    (error
+                     (message "Panel: Weather parse error: %s" err))))
+          :else (lambda (err)
+                  (setq panel--weather-fetch-in-progress nil)
+                  (message "Panel: Weather error (attempt %d/%d): %s"
+                           (1+ panel--weather-retry-count)
+                           panel-weather-max-retries
+                           err)
+                  (when (< panel--weather-retry-count panel-weather-max-retries)
+                    (setq panel--weather-retry-count (1+ panel--weather-retry-count))
+                    (run-with-timer (* 30 panel--weather-retry-count) nil
+                                   #'panel--fetch-weather-data initial force))))))))
 
 (defun panel--refresh-weather-only ()
   "Only refresh weather information without redrawing entire screen."
