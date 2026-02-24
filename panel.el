@@ -21,6 +21,10 @@
 
 ;;; Code:
 
+(defgroup panel nil
+  "Panel group."
+  :group 'applications)
+
 (defvar panel-mode nil)
 (defvar panel-recentfiles '() "Recent list.")
 (defvar panel-temperature nil)
@@ -105,10 +109,6 @@
   :group 'panel
   :type 'integer)
 
-(defgroup panel nil
-  "Panel group."
-  :group 'applications)
-
 (defconst panel-buffer "*welcome*"
   "Panel buffer name.")
 
@@ -143,7 +143,7 @@
     map)
   "Keymap for `panel-mode'.")
 
-(define-derived-mode panel-mode fundamental-mode "dashboard"
+(define-derived-mode panel-mode special-mode "dashboard"
   "Major mode for the welcome-panel screen."
   :group 'panel
   :syntax-table nil
@@ -153,7 +153,7 @@
   (setq-local truncate-lines t)
   (setq-local mode-line-format nil)
   (setq-local global-hl-line-mode nil)
-  (setq cursor-type nil))
+  (setq-local cursor-type nil))
 
 (defface panel-title-face
   '((t :inherit font-lock-constant-face :height 1.3 :italic t))
@@ -166,7 +166,7 @@
   :group 'panel)
 
 (defface panel-separator-face
-  '((t :inherit 'font-lock-comment-face))
+  '((t :inherit font-lock-comment-face))
   "Separator face."
   :group 'panel)
 
@@ -281,7 +281,7 @@
       (find-file (nth (1- index) files)))))
 
 (defun panel--truncate-path-in-middle (path n)
-  "Truncate the middle of PATH to length N by removing characters and adding an ellipsis."
+  "Truncate the middle of PATH to length N with an ellipsis."
   (if (<= (length path) n)
       path
     (let* ((left (/ (- n 3) 2))
@@ -293,7 +293,7 @@
 
 (defun panel--insert-recent-files ()
   "Insert the first x recent files with icons in the panel buffer."
-  (recentf-mode)
+  (recentf-mode 1)
   (setq panel-recentfiles (seq-take recentf-list 9))
   (let* ((files panel-recentfiles)
          (left-margin (panel--calculate-padding-left)))
@@ -370,18 +370,39 @@
                           :height panel-image-height)))
     panel--cached-image))
 
+(defun panel--process-weather-json (json-obj initial)
+  "Update weather state from JSON-OBJ.
+INITIAL indicates if this is the first fetch; starts the periodic timer."
+  (condition-case err
+      (let-alist json-obj
+        (when (and .current_weather
+                   .current_weather.temperature
+                   .current_weather.weathercode)
+          (setq panel-temperature (format "%.1f" .current_weather.temperature))
+          (setq panel-weatherdescription
+                (panel--weather-code-to-string .current_weather.weathercode))
+          (setq panel-weathericon
+                (panel--weather-icon-from-code .current_weather.weathercode))
+          (setq panel--last-weather-update (float-time))
+          (when (and initial (not panel--weather-timer))
+            (setq panel--weather-timer
+                  (run-with-timer panel-weather-update-interval
+                                  panel-weather-update-interval
+                                  #'panel--fetch-weather-data)))
+          (when (panel--active-p)
+            (panel--refresh-weather-only))))
+    (error (message "Panel: Weather parse error: %s" err))))
+
 (defun panel--fetch-weather-data (&optional initial force)
   "Fetch weather data from API.
 INITIAL indicates if this is the first fetch.
 FORCE bypasses cache check."
-  (when (or initial force (panel--is-active))
+  (when (or initial force (panel--active-p))
     (when (and (not initial) (not force) (panel--weather-cache-valid-p))
       (message "Panel: Using cached weather data"))
-
     (unless (or panel--weather-fetch-in-progress
                 (and (not initial) (not force) (panel--weather-cache-valid-p)))
       (setq panel--weather-fetch-in-progress t)
-
       (let ((url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
                          panel-latitude panel-longitude)))
         (plz 'get url
@@ -389,33 +410,12 @@ FORCE bypasses cache check."
           :then (lambda (json-obj)
                   (setq panel--weather-fetch-in-progress nil)
                   (setq panel--weather-retry-count 0)
-                  (condition-case err
-                      (let-alist json-obj
-                        (when (and .current_weather
-                                   .current_weather.temperature
-                                   .current_weather.weathercode)
-                          (setq panel-temperature
-                                (format "%.1f" .current_weather.temperature))
-                          (setq panel-weatherdescription
-                                (panel--weather-code-to-string .current_weather.weathercode))
-                          (setq panel-weathericon
-                                (panel--weather-icon-from-code .current_weather.weathercode))
-                          (setq panel--last-weather-update (float-time))
-                          (when (and initial (not panel--weather-timer))
-                            (setq panel--weather-timer
-                                  (run-with-timer panel-weather-update-interval
-                                                  panel-weather-update-interval
-                                                  #'panel--fetch-weather-data)))
-                          (when (panel--is-active)
-                            (panel--refresh-weather-only))))
-                    (error
-                     (message "Panel: Weather parse error: %s" err))))
+                  (panel--process-weather-json json-obj initial))
           :else (lambda (err)
                   (setq panel--weather-fetch-in-progress nil)
                   (message "Panel: Weather error (attempt %d/%d): %s"
                            (1+ panel--weather-retry-count)
-                           panel-weather-max-retries
-                           err)
+                           panel-weather-max-retries err)
                   (when (< panel--weather-retry-count panel-weather-max-retries)
                     (setq panel--weather-retry-count (1+ panel--weather-retry-count))
                     (run-with-timer (* 30 panel--weather-retry-count) nil
@@ -423,20 +423,19 @@ FORCE bypasses cache check."
 
 (defun panel--refresh-weather-only ()
   "Only refresh weather information without redrawing entire screen."
-  (when (get-buffer panel-buffer)
-    (with-current-buffer panel-buffer
+  (when-let* ((buf (get-buffer panel-buffer)))
+    (with-current-buffer buf
       (let ((inhibit-read-only t)
-            (pos (point)))
+            (saved-pos (point)))
         (save-excursion
           (goto-char (point-min))
-          (when (re-search-forward "Loading weather\\|Clear sky\\|Partly cloudy\\|Fog\\|Drizzle\\|Rain\\|Snow\\|Thunderstorm" nil t)
-            (beginning-of-line)
-            (let ((line-start (point)))
-              (forward-line 1)
-              (delete-region line-start (point))
-              (goto-char line-start)
-              (panel--insert-weather-info))))
-        (goto-char pos)))))
+          (when-let* ((match (text-property-search-forward 'panel-section 'weather t))
+                      (beg (prop-match-beginning match))
+                      (end (prop-match-end match)))
+            (goto-char beg)
+            (delete-region beg end)
+            (panel--insert-weather-info)))
+        (goto-char (min saved-pos (point-max)))))))
 
 (defun panel--cleanup-weather ()
   "Cancel weather timer and reset state."
@@ -454,14 +453,14 @@ FORCE bypasses cache check."
 (defun panel--init-weather ()
   "Initialize weather fetching with cleanup."
   (panel--cleanup-weather)
-  (when (panel--show-weather-info)
+  (when (panel--weather-info-p)
     (panel--fetch-weather-data t)))
 
 (defun panel-refresh ()
   "Manually refresh the panel and weather."
   (interactive)
   (panel--refresh-screen)
-  (when (panel--show-weather-info)
+  (when (panel--weather-info-p)
     (panel--fetch-weather-data nil t)))
 
 ;;;###autoload
@@ -497,21 +496,23 @@ FORCE bypasses cache check."
                               (propertize packages 'face 'panel-info-face 'display '(raise -0.1))
                               (propertize "packages loaded" 'face 'panel-text-info-face 'display '(raise -0.1)))))
 
-(defun panel--show-weather-info ()
+(defun panel--weather-info-p ()
   "Check if we have latitude and longitude to show weather info."
   (and (floatp panel-latitude) (floatp panel-longitude)
        (> panel-latitude 0.0) (> panel-longitude 0.0)))
 
 (defun panel--insert-weather-info ()
-  "Insert weather info."
-  (when (panel--show-weather-info)
-    (if panel-weatherdescription
-        (panel--insert-text (format "%s %s, %s%s"
-                                    (propertize panel-weathericon 'face '(:family "Weather icons" :height 1.0) 'display '(raise 0))
-                                    (propertize panel-weatherdescription 'face 'panel-weather-description-face)
-                                    (propertize panel-temperature 'face 'panel-weather-temperature-face)
-                                    (propertize "℃" 'face 'panel-text-info-face)))
-      (panel--insert-text (propertize "Loading weather data..." 'face 'panel-weather-temperature-face)))))
+  "Insert weather info, tagged with \\='panel-section \\='weather text property."
+  (when (panel--weather-info-p)
+    (let ((beg (point)))
+      (if panel-weatherdescription
+          (panel--insert-text (format "%s %s, %s%s"
+                                      (propertize panel-weathericon 'face '(:family "Weather icons" :height 1.0) 'display '(raise 0))
+                                      (propertize panel-weatherdescription 'face 'panel-weather-description-face)
+                                      (propertize panel-temperature 'face 'panel-weather-temperature-face)
+                                      (propertize "℃" 'face 'panel-text-info-face)))
+        (panel--insert-text (propertize "Loading weather data..." 'face 'panel-weather-temperature-face)))
+      (put-text-property beg (point) 'panel-section 'weather))))
 
 (defun panel--package-length ()
   "Get the number of installed packages."
@@ -524,7 +525,7 @@ FORCE bypasses cache check."
     (length elpaca--queued))
    (t 0)))
 
-(defun panel--is-active ()
+(defun panel--active-p ()
   "Check if buffer is active and visible."
   (and (buffer-live-p (get-buffer panel-buffer))
        (get-buffer-window panel-buffer 'visible)))
@@ -533,22 +534,20 @@ FORCE bypasses cache check."
   "Show the panel screen."
   (setq panel-recentfiles (seq-take recentf-list 9))
   (with-current-buffer (get-buffer-create panel-buffer)
-    (let* ((buffer-read-only)
-           (image (panel--get-image))
+    (let* ((image (panel--get-image))
            (size (when image (image-size image)))
            (width (when size (car size)))
            (left-margin (if width
                             (max panel-min-left-padding (floor (/ (- (window-width) width) 2)))
                           panel-min-left-padding))
            (packages (format "%d" (panel--package-length))))
-      (erase-buffer)
-      (goto-char (point-min))
       (let ((inhibit-read-only t))
+        (erase-buffer)
+        (goto-char (point-min))
         (panel--insert-text (propertize panel-title 'face 'panel-title-face))
         (insert "\n")
         ;; (panel--insert-separator)
         (panel--insert-recent-files)
-        (setq cursor-type nil)
 
         (insert "\n")
         (panel--insert-startup-time)
