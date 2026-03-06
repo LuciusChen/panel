@@ -365,7 +365,9 @@
     (unless (and panel--cached-image
                  (equal panel-image-file (plist-get (cdr panel--cached-image) :file)))
       (setq panel--cached-image
-            (create-image panel-image-file 'png nil
+            (create-image panel-image-file
+                          (or (image-type-from-file-name panel-image-file) 'png)
+                          nil
                           :width panel-image-width
                           :height panel-image-height)))
     panel--cached-image))
