@@ -91,10 +91,11 @@ Set both coordinates to enable weather. Negative values are valid.
       panel-longitude 121.4737
       panel-weather-update-interval 900
       panel-weather-cache-duration 900
-      panel-weather-max-retries 3)
+      panel-weather-max-retries 3
+      panel-weather-api-base-url "https://api.open-meteo.com/v1/forecast")
 ```
 
-Weather is fetched from Open-Meteo and refreshed on a timer. Cached data is reused while valid.
+Weather is fetched from Open-Meteo and refreshed on a timer. Cached data is reused while valid, and transient API failures show `Weather unavailable` instead of leaving the panel stuck on `Loading weather data...`.
 
 ### Image
 
@@ -128,6 +129,7 @@ If `panel-image-file` points to an existing PNG file, it is shown above the rece
 - `panel-weather-update-interval`
 - `panel-weather-cache-duration`
 - `panel-weather-max-retries`
+- `panel-weather-api-base-url`
 - `panel-show-file-path`
 - `panel-intro-display`
 - `panel-intro-lines`

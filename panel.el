@@ -37,6 +37,8 @@
 (defvar panel-temperature nil)
 (defvar panel-weatherdescription nil)
 (defvar panel-weathericon nil)
+(defvar panel--weather-error-message nil
+  "Last weather error message, if any.")
 
 (defvar panel--weather-timer nil
   "Timer for periodic weather updates.")
@@ -149,6 +151,11 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
   "Maximum number of retry attempts for weather fetch."
   :group 'panel
   :type 'integer)
+
+(defcustom panel-weather-api-base-url "https://api.open-meteo.com/v1/forecast"
+  "Base URL for weather requests."
+  :group 'panel
+  :type 'string)
 
 (defconst panel-buffer "*welcome*"
   "Panel buffer name.")
@@ -617,6 +624,29 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
        (< (- (float-time) panel--last-weather-update)
           panel-weather-cache-duration)))
 
+(defun panel--weather-data-available-p ()
+  "Check if we have weather data ready to display."
+  (and panel-weatherdescription
+       panel-temperature))
+
+(defun panel--weather-request-url ()
+  "Build the weather request URL."
+  (format "%s?latitude=%s&longitude=%s&current=temperature_2m,weather_code"
+          panel-weather-api-base-url
+          panel-latitude
+          panel-longitude))
+
+(defun panel--extract-weather-fields (json-obj)
+  "Extract current temperature and weather code from JSON-OBJ."
+  (let* ((current (alist-get 'current json-obj))
+         (current-weather (alist-get 'current_weather json-obj))
+         (temperature (or (alist-get 'temperature_2m current)
+                          (alist-get 'temperature current-weather)))
+         (weather-code (or (alist-get 'weather_code current)
+                           (alist-get 'weathercode current-weather))))
+    (when (and temperature weather-code)
+      (list temperature weather-code))))
+
 (defun panel--get-image ()
   "Get or create cached image."
   (when (and (display-images-p)
@@ -636,24 +666,33 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
   "Update weather state from JSON-OBJ.
 INITIAL indicates if this is the first fetch; starts the periodic timer."
   (condition-case err
-      (let-alist json-obj
-        (when (and .current_weather
-                   .current_weather.temperature
-                   .current_weather.weathercode)
-          (setq panel-temperature (format "%.1f" .current_weather.temperature))
-          (setq panel-weatherdescription
-                (panel--weather-code-to-string .current_weather.weathercode))
-          (setq panel-weathericon
-                (panel--weather-icon-from-code .current_weather.weathercode))
-          (setq panel--last-weather-update (float-time))
-          (when (and initial (not panel--weather-timer))
-            (setq panel--weather-timer
-                  (run-with-timer panel-weather-update-interval
-                                  panel-weather-update-interval
-                                  #'panel--fetch-weather-data)))
-          (when (panel--active-p)
-            (panel--refresh-weather-only))))
-    (error (message "Panel: Weather parse error: %s" err))))
+      (if-let* ((weather-fields (panel--extract-weather-fields json-obj)))
+          (pcase-let ((`(,temperature ,weather-code) weather-fields))
+            (setq panel--weather-error-message nil)
+            (setq panel-temperature (format "%.1f" temperature))
+            (setq panel-weatherdescription
+                  (panel--weather-code-to-string weather-code))
+            (setq panel-weathericon
+                  (panel--weather-icon-from-code weather-code))
+            (setq panel--last-weather-update (float-time))
+            (when (and initial (not panel--weather-timer))
+              (setq panel--weather-timer
+                    (run-with-timer panel-weather-update-interval
+                                    panel-weather-update-interval
+                                    #'panel--fetch-weather-data)))
+            (when (panel--active-p)
+              (panel--refresh-weather-only)))
+        (setq panel--weather-error-message "Weather unavailable")
+        (message "Panel: Weather parse error: missing current weather data")
+        (when (and (panel--active-p)
+                   (not (panel--weather-data-available-p)))
+          (panel--refresh-weather-only)))
+    (error
+     (setq panel--weather-error-message "Weather unavailable")
+     (message "Panel: Weather parse error: %s" err)
+     (when (and (panel--active-p)
+                (not (panel--weather-data-available-p)))
+       (panel--refresh-weather-only)))))
 
 (defun panel--fetch-weather-data (&optional initial force)
   "Fetch weather data from API.
@@ -665,8 +704,7 @@ FORCE bypasses cache check."
     (unless (or panel--weather-fetch-in-progress
                 (and (not initial) (not force) (panel--weather-cache-valid-p)))
       (setq panel--weather-fetch-in-progress t)
-      (let ((url (format "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true"
-                         panel-latitude panel-longitude)))
+      (let ((url (panel--weather-request-url)))
         (plz 'get url
           :as #'json-read
           :then (lambda (json-obj)
@@ -678,6 +716,10 @@ FORCE bypasses cache check."
                   (message "Panel: Weather error (attempt %d/%d): %s"
                            (1+ panel--weather-retry-count)
                            panel-weather-max-retries err)
+                  (unless (panel--weather-data-available-p)
+                    (setq panel--weather-error-message "Weather unavailable")
+                    (when (panel--active-p)
+                      (panel--refresh-weather-only)))
                   (when (< panel--weather-retry-count panel-weather-max-retries)
                     (setq panel--weather-retry-count (1+ panel--weather-retry-count))
                     (run-with-timer (* 30 panel--weather-retry-count) nil
@@ -793,7 +835,10 @@ FORCE bypasses cache check."
                      (propertize panel-weatherdescription 'face 'panel-weather-description-face)
                      (propertize panel-temperature 'face 'panel-weather-temperature-face)
                      (propertize "℃" 'face 'panel-text-info-face))))
-        (panel--insert-text (propertize "Loading weather data..." 'face 'panel-weather-temperature-face)))
+        (panel--insert-text
+         (propertize (or panel--weather-error-message
+                         "Loading weather data...")
+                     'face 'panel-weather-temperature-face)))
       (put-text-property beg (point) 'panel-section 'weather))))
 
 (defun panel--package-length ()
