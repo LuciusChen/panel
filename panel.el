@@ -828,9 +828,7 @@ FORCE bypasses cache check."
                        (propertize "℃" 'face 'panel-text-info-face))
              (format "%s %s, %s%s"
                      (if (panel--nerd-icons-available-p)
-                         (propertize icon
-                                     'face '(:family "Weather icons" :height 1.0)
-                                     'display '(raise 0))
+                         (propertize icon 'display '(raise 0))
                        (propertize icon 'face 'panel-weather-icon-face))
                      (propertize panel-weatherdescription 'face 'panel-weather-description-face)
                      (propertize panel-temperature 'face 'panel-weather-temperature-face)
