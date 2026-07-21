@@ -28,6 +28,91 @@
           (should (equal (get-text-property 0 'path line)
                          (expand-file-name file))))))))
 
+(ert-deftest panel-test-remote-recent-path-does-not-probe-filesystem ()
+  (let* ((file "/ssh:test@example.invalid:/tmp/example.org/")
+         (panel-use-icons nil)
+         handler-called
+         (file-name-handler-alist
+          (cons (cons "\\`/ssh:"
+                      (lambda (&rest _)
+                        (setq handler-called t)
+                        (error "Remote file-name handler was invoked")))
+                file-name-handler-alist)))
+    (let ((line (panel--recent-file-line file 1)))
+      (should (stringp line))
+      (should (equal (get-text-property 0 'path line) file)))
+    (should-not handler-called)))
+
+(ert-deftest panel-test-recentf-initialization-avoids-tramp ()
+  (let ((recentf-mode nil)
+        (recentf-list nil)
+        (recentf-auto-cleanup 'mode)
+        (recentf-keep '(recentf-keep-default-predicate))
+        (recentf-initialize-file-name-history t)
+        (file-name-history nil)
+        (file-name-handler-alist
+         (cons '("\\.zip/" . tramp-archive-autoload-file-name-handler)
+               file-name-handler-alist))
+        mode-called)
+    (cl-letf (((symbol-function 'recentf-mode)
+               (lambda (_arg)
+                 (setq mode-called t
+                       recentf-mode t
+                       recentf-list '("/ssh:test@example.invalid:/tmp/a"))
+                 (should (eq recentf-auto-cleanup 'mode))
+                 (should-not recentf-initialize-file-name-history)
+                 (should
+                  (cl-some
+                   (lambda (keep)
+                     (and (stringp keep)
+                          (string-match-p keep (car recentf-list))))
+                   recentf-keep))
+                 (should-not
+                  (cl-find-if
+                   (lambda (entry)
+                     (memq (cdr entry)
+                           '(tramp-autoload-file-name-handler
+                             tramp-file-name-handler
+                             tramp-archive-autoload-file-name-handler
+                             tramp-archive-file-name-handler)))
+                   file-name-handler-alist))
+                 (should
+                  (cl-some
+                   (lambda (keep)
+                     (and (stringp keep)
+                          (string-match-p keep "/tmp/a.zip/inside.txt")))
+                   recentf-keep)))))
+      (panel--ensure-recentf))
+    (should mode-called)
+    (should (equal file-name-history recentf-list))))
+
+(ert-deftest panel-test-recent-files-render-each-line-once ()
+  (let ((recentf-list '("/tmp/first.el" "/tmp/second.org"))
+        (panel-recentfiles nil)
+        (panel-title "Recent files")
+        (panel-intro-display 'never)
+        (panel-image-file "")
+        (panel-latitude nil)
+        (panel-longitude nil)
+        (panel-use-icons nil)
+        calls)
+    (unwind-protect
+        (cl-letf (((symbol-function 'panel--ensure-recentf) #'ignore)
+                  ((symbol-function 'panel--package-length) (lambda () 0))
+                  ((symbol-function 'panel--recent-file-line)
+                   (lambda (file index)
+                     (push (cons file index) calls)
+                     (format "%s [%d]" file index))))
+          (panel--refresh-screen)
+          (should (equal (nreverse calls)
+                         '(("/tmp/first.el" . 1)
+                           ("/tmp/second.org" . 2))))
+          (with-current-buffer panel-buffer
+            (should (eq major-mode 'panel-mode))
+            (should (= (length panel--recent-file-lines) 2))))
+      (when (get-buffer panel-buffer)
+        (kill-buffer panel-buffer)))))
+
 (ert-deftest panel-test-file-icon-is-not-stale ()
   (let ((panel-use-icons nil)
         (file (make-temp-file "panel-icon-" nil ".el")))

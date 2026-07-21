@@ -172,6 +172,9 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
 (defvar-local panel--padding-cache nil
   "Cache for padding in the panel buffer.")
 
+(defvar-local panel--recent-file-lines nil
+  "Rendered recent-file lines for the current panel refresh.")
+
 (defvar-local panel--last-window-width nil
   "Last window width in the panel buffer.")
 
@@ -460,18 +463,58 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
     (insert text)))
 
 (defun panel--ensure-recentf ()
-  "Ensure `recentf' is initialized and loaded."
-  (unless recentf-mode
-    (recentf-mode 1))
-  (unless (bound-and-true-p recentf-list)
-    (setq recentf-list nil))
-  (when (and (boundp 'recentf-list)
-             (not recentf-list))
-    (recentf-load-list)))
+  "Ensure `recentf' is initialized without probing saved paths."
+  (let* ((initialize-history recentf-initialize-file-name-history)
+         (remote-regexp (concat "\\(?:" tramp-autoload-file-name-regexp
+                                "\\|" tramp-file-name-regexp "\\)"))
+         (tramp-io-handlers
+          '(tramp-autoload-file-name-handler
+            tramp-file-name-handler
+            tramp-archive-autoload-file-name-handler
+            tramp-archive-file-name-handler))
+         (archive-regexps
+          (cl-loop for (regexp . handler) in file-name-handler-alist
+                   when (memq handler
+                              '(tramp-archive-autoload-file-name-handler
+                                tramp-archive-file-name-handler))
+                   collect regexp))
+         ;; Keep the default cleanup semantics without asking TRAMP about
+         ;; remote or archive entries.  A nil `recentf-keep' already keeps all.
+         (recentf-keep (and recentf-keep
+                            (append archive-regexps
+                                    (cons remote-regexp recentf-keep))))
+         (recentf-initialize-file-name-history nil)
+         (file-name-handler-alist
+          (cl-remove-if
+           (lambda (entry)
+             (memq (cdr entry) tramp-io-handlers))
+           file-name-handler-alist)))
+    (unless recentf-mode
+      (recentf-mode 1))
+    (unless (bound-and-true-p recentf-list)
+      (setq recentf-list nil))
+    (when (and (boundp 'recentf-list)
+               (not recentf-list))
+      (recentf-load-list))
+    (when (and initialize-history (not file-name-history))
+      (setq file-name-history (mapcar #'abbreviate-file-name recentf-list)))))
+
+(defun panel--tramp-file-name-p (file)
+  "Return non-nil when FILE has syntax handled by TRAMP.
+This check does not load TRAMP or invoke a file-name handler."
+  (and tramp-mode
+       (stringp file)
+       (or (string-match-p tramp-autoload-file-name-regexp file)
+           (string-match-p tramp-file-name-regexp file))))
 
 (defun panel--file-icon (file)
   "Return the icon for FILE."
-  (cond ((not (file-exists-p file))
+  (cond ((panel--tramp-file-name-p file)
+         (panel--with-icon-fallback
+          #'nerd-icons-codicon
+          "nf-cod-remote"
+          (propertize "@" 'face 'shadow)))
+        ((not (file-exists-p file))
          (panel--with-icon-fallback
           #'nerd-icons-mdicon
           "nf-md-file_remove"
@@ -548,13 +591,20 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
 
 (defun panel--recent-file-line (file index)
   "Return the rendered line for FILE at INDEX."
-  (let* ((display-file (directory-file-name file))
-         (full-path (expand-file-name display-file))
+  (let* ((remote (panel--tramp-file-name-p file))
+         (icon (panel--file-icon file))
+         ;; File-name primitives invoke TRAMP handlers too.  For a known
+         ;; remote name, use them only as pure string operations for display.
+         (file-name-handler-alist (if remote nil file-name-handler-alist))
+         (display-file (directory-file-name file))
+         (full-path (if remote file (expand-file-name display-file)))
          (shortcut (format "[%d]" index))
          (file-name (file-name-nondirectory display-file))
          (visible-path (if (or panel-show-file-path
                                (string-empty-p file-name))
-                           (abbreviate-file-name full-path)
+                           (if remote
+                               display-file
+                             (abbreviate-file-name full-path))
                          file-name))
          (display-path (panel--truncate-path-in-middle
                         visible-path panel-path-max-length))
@@ -568,23 +618,17 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
                         (concat (propertize display-dir 'face 'panel-path-face)
                                 (propertize display-name 'face 'panel-filename-face))
                       (propertize display-path 'face 'panel-filename-face)))
-         (title (concat (panel--file-icon file)
-                        " "
-                        path-text)))
+         (title (concat icon " " path-text)))
     (concat (propertize title 'path full-path)
             (propertize (format " %s" shortcut) 'face 'panel-shortcut-face))))
 
 (defun panel--insert-recent-files ()
   "Insert the first x recent files with icons in the panel buffer."
-  (panel--ensure-recentf)
-  (setq panel-recentfiles (seq-take recentf-list 9))
-  (let ((left-margin (panel--calculate-padding-left))
-        (index 1))
-    (dolist (file panel-recentfiles)
+  (let ((left-margin (panel--calculate-padding-left)))
+    (dolist (line panel--recent-file-lines)
       (insert (make-string left-margin ?\s))
-      (insert (panel--recent-file-line file index))
-      (insert "\n")
-      (setq index (1+ index)))))
+      (insert line)
+      (insert "\n"))))
 
 (defun panel--calculate-padding-left ()
   "Calculate padding for left side."
@@ -593,14 +637,10 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
               (not (eq current-width panel--last-window-width)))
       (setq panel--last-window-width current-width)
       (setq panel--padding-cache
-            (if panel-recentfiles
-                (let ((max-width 0)
-                      (index 1))
-                  (dolist (file panel-recentfiles)
-                    (setq max-width
-                          (max max-width
-                               (string-width (panel--recent-file-line file index))))
-                    (setq index (1+ index)))
+            (if panel--recent-file-lines
+                (let ((max-width 0))
+                  (dolist (line panel--recent-file-lines)
+                    (setq max-width (max max-width (string-width line))))
                   (max panel-min-left-padding
                        (floor (/ (- current-width max-width) 2))))
               panel-min-left-padding)))
@@ -940,7 +980,13 @@ RETRY-COUNT belongs to the current request chain."
   (panel--ensure-recentf)
   (setq panel-recentfiles (seq-take recentf-list 9))
   (with-current-buffer (get-buffer-create panel-buffer)
-    (setq panel--padding-cache nil)
+    (unless (eq major-mode 'panel-mode)
+      (panel-mode))
+    (setq panel--padding-cache nil
+          panel--recent-file-lines
+          (cl-loop for file in panel-recentfiles
+                   for index from 1
+                   collect (panel--recent-file-line file index)))
     (let* ((image (panel--get-image))
            (size (when image (image-size image)))
            (width (when size (car size)))
@@ -981,7 +1027,6 @@ RETRY-COUNT belongs to the current request chain."
         (panel--insert-centered (propertize (format-time-string "%A, %B %d %R") 'face 'panel-time-face))
 
         (switch-to-buffer panel-buffer)
-        (panel-mode)
         (goto-char (point-min))
         (if (re-search-forward " \\[[1-9]\\]" nil t)
             (beginning-of-line)
