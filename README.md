@@ -18,10 +18,9 @@ A small Emacs startup panel focused on recent files, startup info, and optional 
 ## Requirements
 
 - Emacs 27.1+
-- [`plz`](https://github.com/alphapapa/plz)
 - [`nerd-icons`](https://github.com/rainstormstudio/nerd-icons.el) for file and status icons (optional but recommended)
 
-`recentf` is built in.
+`recentf` and the URL library are built into Emacs.
 
 ## Installation
 
@@ -32,7 +31,7 @@ A small Emacs startup panel focused on recent files, startup info, and optional 
   :straight (:host github
              :repo "LuciusChen/panel")
   :init
-  (setq panel-title "Quick access [C-number to open file]"
+  (setq panel-title "Quick access [1-9 to open file]"
         panel-min-left-padding 10
         panel-path-max-length 72)
   :config
@@ -52,7 +51,7 @@ A small Emacs startup panel focused on recent files, startup info, and optional 
 ### Basic
 
 ```elisp
-(setq panel-title "Quick access [C-number to open file]"
+(setq panel-title "Quick access [1-9 to open file]"
       panel-min-left-padding 10
       panel-path-max-length 72
       panel-intro-display 'tty
@@ -90,12 +89,12 @@ Set both coordinates to enable weather. Negative values are valid.
 (setq panel-latitude 31.2304
       panel-longitude 121.4737
       panel-weather-update-interval 900
-      panel-weather-cache-duration 900
       panel-weather-max-retries 3
+      panel-weather-request-timeout 15
       panel-weather-api-base-url "https://api.open-meteo.com/v1/forecast")
 ```
 
-Weather is fetched from Open-Meteo and refreshed on a timer. Cached data is reused while valid, and transient API failures show `Weather unavailable` instead of leaving the panel stuck on `Loading weather data...`.
+Weather is fetched directly from Open-Meteo with Emacs's built-in URL library; redirects are not followed. Requests are aborted after the configured timeout, failures are retried with backoff, and the periodic timer remains active after startup failures so the panel can recover automatically.
 
 ### Image
 
@@ -127,8 +126,8 @@ If `panel-image-file` points to an existing PNG file, it is shown above the rece
 - `panel-image-width`
 - `panel-image-height`
 - `panel-weather-update-interval`
-- `panel-weather-cache-duration`
 - `panel-weather-max-retries`
+- `panel-weather-request-timeout`
 - `panel-weather-api-base-url`
 - `panel-show-file-path`
 - `panel-intro-display`

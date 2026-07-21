@@ -1,4 +1,4 @@
-;;; panel.el --- Simple welcome-panel screen -*- lexical-binding: t -*-
+;;; panel.el --- Minimal startup screen -*- lexical-binding: t -*-
 
 ;; Welcome-panel screen
 
@@ -6,8 +6,9 @@
 ;; Maintainer: Mikael Konradsson <mikael.konradsson@outlook.com>
 ;; Created: 2023
 ;; Version: 0.2
-;; Package-Requires: ((emacs "27.1") (plz "0.7"))
-;; Homepage: https://github.com/konrad1977/welcome-panel
+;; Package-Requires: ((emacs "27.1"))
+;; URL: https://github.com/LuciusChen/panel
+;; Assisted-by: OpenAI Codex
 
 ;;; Commentary:
 
@@ -15,9 +16,11 @@
 
 (require 'cl-lib)
 (require 'json)
-(require 'plz)
 (require 'recentf)
+(require 'seq)
 (require 'subr-x)
+(require 'url)
+(require 'url-http)
 
 (declare-function nerd-icons-icon-for-file "nerd-icons")
 (declare-function nerd-icons-icon-for-dir "nerd-icons")
@@ -32,33 +35,33 @@
   "Panel group."
   :group 'applications)
 
-(defvar panel-mode nil)
-(defvar panel-recentfiles '() "Recent list.")
-(defvar panel-temperature nil)
-(defvar panel-weatherdescription nil)
-(defvar panel-weathericon nil)
+(defvar panel-recentfiles nil
+  "Recent files currently rendered by the panel.")
+
+(defvar panel-temperature nil
+  "Current weather temperature as a display string.")
+
+(defvar panel-weatherdescription nil
+  "Current weather description as a display string.")
+
+(defvar panel-weathericon nil
+  "Current weather icon as a display string.")
 (defvar panel--weather-error-message nil
   "Last weather error message, if any.")
 
 (defvar panel--weather-timer nil
   "Timer for periodic weather updates.")
 
-(defvar panel--weather-fetch-in-progress nil
-  "Flag to prevent concurrent weather fetches.")
+(defvar panel--weather-retry-timer nil
+  "Timer for the next weather retry.")
+
+(defvar panel--weather-request nil
+  "Active weather request as a vector of response buffer and timeout timer.")
 
 (defvar panel--resize-timer nil
   "Timer for debouncing resize events.")
 
-(defvar panel--last-weather-update nil
-  "Timestamp of last successful weather update.")
-
-(defvar panel--weather-retry-count 0
-  "Number of retry attempts for weather fetch.")
-
-(defvar panel--cached-image nil
-  "Cached image object.")
-
-(defcustom panel-title "Quick access [C-number to open file]"
+(defcustom panel-title "Quick access [1-9 to open file]"
   "Panel title."
   :group 'panel
   :type 'string)
@@ -81,12 +84,14 @@
 (defcustom panel-latitude nil
   "Latitude for weather information."
   :group 'panel
-  :type 'float)
+  :type '(choice (const :tag "Disabled" nil)
+                 number))
 
 (defcustom panel-longitude nil
   "Longitude for weather information in panel package."
   :group 'panel
-  :type 'float)
+  :type '(choice (const :tag "Disabled" nil)
+                 number))
 
 (defcustom panel-image-file ""
   "Image file in panel package."
@@ -140,17 +145,21 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
 (defcustom panel-weather-update-interval 900
   "Interval in seconds between weather updates."
   :group 'panel
-  :type 'integer)
-
-(defcustom panel-weather-cache-duration 900
-  "Weather cache duration in seconds."
-  :group 'panel
-  :type 'integer)
+  :type '(integer :tag "Positive integer"
+                  :match-alternatives
+                  ((lambda (value) (and (integerp value) (> value 0))))))
 
 (defcustom panel-weather-max-retries 3
   "Maximum number of retry attempts for weather fetch."
   :group 'panel
-  :type 'integer)
+  :type 'natnum)
+
+(defcustom panel-weather-request-timeout 15
+  "Seconds before aborting a weather request."
+  :group 'panel
+  :type '(integer :tag "Positive integer"
+                  :match-alternatives
+                  ((lambda (value) (and (integerp value) (> value 0))))))
 
 (defcustom panel-weather-api-base-url "https://api.open-meteo.com/v1/forecast"
   "Base URL for weather requests."
@@ -159,9 +168,6 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
 
 (defconst panel-buffer "*welcome*"
   "Panel buffer name.")
-
-(defvar panel--file-icon-cache (make-hash-table :test 'equal)
-  "Cache for file icons.")
 
 (defvar-local panel--padding-cache nil
   "Cache for padding in the panel buffer.")
@@ -465,25 +471,22 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
 
 (defun panel--file-icon (file)
   "Return the icon for FILE."
-  (or (gethash file panel--file-icon-cache)
-      (puthash file
-               (cond ((not (file-exists-p file))
-                      (panel--with-icon-fallback
-                       #'nerd-icons-mdicon
-                       "nf-md-file_remove"
-                       (propertize "!" 'face 'error)
-                       :face '(:inherit nerd-icons-red)))
-                     ((file-directory-p file)
-                      (panel--with-icon-fallback
-                       #'nerd-icons-icon-for-dir
-                       file
-                       (propertize "/" 'face 'dired-directory)))
-                     (t
-                      (panel--with-icon-fallback
-                       #'nerd-icons-icon-for-file
-                       file
-                       (propertize "-" 'face 'shadow))))
-               panel--file-icon-cache)))
+  (cond ((not (file-exists-p file))
+         (panel--with-icon-fallback
+          #'nerd-icons-mdicon
+          "nf-md-file_remove"
+          (propertize "!" 'face 'error)
+          :face '(:inherit nerd-icons-red)))
+        ((file-directory-p file)
+         (panel--with-icon-fallback
+          #'nerd-icons-icon-for-dir
+          file
+          (propertize "/" 'face 'dired-directory)))
+        (t
+         (panel--with-icon-fallback
+          #'nerd-icons-icon-for-file
+          file
+          (propertize "-" 'face 'shadow)))))
 
 (defun panel--string-suffix-to-width (text width)
   "Return the widest suffix of TEXT that fits in WIDTH columns."
@@ -549,23 +552,25 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
          (full-path (expand-file-name display-file))
          (shortcut (format "[%d]" index))
          (file-name (file-name-nondirectory display-file))
-         (file-dir (or (file-name-directory display-file) ""))
-         (fallback-name (panel--truncate-path-in-middle
-                         (abbreviate-file-name full-path)
-                         panel-path-max-length))
-         (path-part (if (and panel-show-file-path
-                             (not (string-empty-p file-name)))
-                        (propertize
-                         (panel--truncate-path-in-middle file-dir panel-path-max-length)
-                         'face 'panel-path-face)
-                      ""))
+         (visible-path (if (or panel-show-file-path
+                               (string-empty-p file-name))
+                           (abbreviate-file-name full-path)
+                         file-name))
+         (display-path (panel--truncate-path-in-middle
+                        visible-path panel-path-max-length))
+         (display-dir (and panel-show-file-path
+                           (file-name-directory display-path)))
+         (display-name (if display-dir
+                           (substring display-path (length display-dir))
+                         display-path))
+         (path-text (if (and display-dir
+                             (not (string-empty-p display-name)))
+                        (concat (propertize display-dir 'face 'panel-path-face)
+                                (propertize display-name 'face 'panel-filename-face))
+                      (propertize display-path 'face 'panel-filename-face)))
          (title (concat (panel--file-icon file)
                         " "
-                        path-part
-                        (propertize (if (string-empty-p file-name)
-                                        fallback-name
-                                      file-name)
-                                    'face 'panel-filename-face))))
+                        path-text)))
     (concat (propertize title 'path full-path)
             (propertize (format " %s" shortcut) 'face 'panel-shortcut-face))))
 
@@ -617,113 +622,158 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
                                  (when (get-buffer-window panel-buffer)
                                    (panel--refresh-screen)))))))
 
-(defun panel--weather-cache-valid-p ()
-  "Check if weather cache is still valid."
-  (and panel--last-weather-update
-       panel-temperature
-       (< (- (float-time) panel--last-weather-update)
-          panel-weather-cache-duration)))
-
-(defun panel--weather-data-available-p ()
-  "Check if we have weather data ready to display."
-  (and panel-weatherdescription
-       panel-temperature))
-
-(defun panel--weather-request-url ()
-  "Build the weather request URL."
-  (format "%s?latitude=%s&longitude=%s&current=temperature_2m,weather_code"
-          panel-weather-api-base-url
-          panel-latitude
-          panel-longitude))
-
-(defun panel--extract-weather-fields (json-obj)
-  "Extract current temperature and weather code from JSON-OBJ."
-  (let* ((current (alist-get 'current json-obj))
-         (current-weather (alist-get 'current_weather json-obj))
-         (temperature (or (alist-get 'temperature_2m current)
-                          (alist-get 'temperature current-weather)))
-         (weather-code (or (alist-get 'weather_code current)
-                           (alist-get 'weathercode current-weather))))
-    (when (and temperature weather-code)
-      (list temperature weather-code))))
-
 (defun panel--get-image ()
-  "Get or create cached image."
+  "Return the configured panel image."
   (when (and (display-images-p)
-             (file-exists-p panel-image-file)
-             (not (string-empty-p panel-image-file)))
-    (unless (and panel--cached-image
-                 (equal panel-image-file (plist-get (cdr panel--cached-image) :file)))
-      (setq panel--cached-image
-            (create-image panel-image-file
-                          nil
-                          nil
-                          :width panel-image-width
-                          :height panel-image-height)))
-    panel--cached-image))
+             (not (string-empty-p panel-image-file))
+             (file-exists-p panel-image-file))
+    (create-image panel-image-file
+                  nil
+                  nil
+                  :width panel-image-width
+                  :height panel-image-height)))
 
-(defun panel--process-weather-json (json-obj initial)
-  "Update weather state from JSON-OBJ.
-INITIAL indicates if this is the first fetch; starts the periodic timer."
-  (condition-case err
-      (if-let* ((weather-fields (panel--extract-weather-fields json-obj)))
-          (pcase-let ((`(,temperature ,weather-code) weather-fields))
-            (setq panel--weather-error-message nil)
-            (setq panel-temperature (format "%.1f" temperature))
-            (setq panel-weatherdescription
-                  (panel--weather-code-to-string weather-code))
-            (setq panel-weathericon
-                  (panel--weather-icon-from-code weather-code))
-            (setq panel--last-weather-update (float-time))
-            (when (and initial (not panel--weather-timer))
-              (setq panel--weather-timer
-                    (run-with-timer panel-weather-update-interval
-                                    panel-weather-update-interval
-                                    #'panel--fetch-weather-data)))
-            (when (panel--active-p)
-              (panel--refresh-weather-only)))
-        (setq panel--weather-error-message "Weather unavailable")
-        (message "Panel: Weather parse error: missing current weather data")
-        (when (and (panel--active-p)
-                   (not (panel--weather-data-available-p)))
-          (panel--refresh-weather-only)))
-    (error
-     (setq panel--weather-error-message "Weather unavailable")
-     (message "Panel: Weather parse error: %s" err)
-     (when (and (panel--active-p)
-                (not (panel--weather-data-available-p)))
-       (panel--refresh-weather-only)))))
+(defun panel--process-weather-json (json-obj)
+  "Update weather state from JSON-OBJ and return non-nil on success."
+  (let* ((current (alist-get 'current json-obj))
+         (temperature (alist-get 'temperature_2m current))
+         (weather-code (alist-get 'weather_code current)))
+    (when (and (numberp temperature) (numberp weather-code))
+      (setq panel--weather-error-message nil
+            panel-temperature (format "%.1f" temperature)
+            panel-weatherdescription (panel--weather-code-to-string weather-code)
+            panel-weathericon (panel--weather-icon-from-code weather-code))
+      t)))
 
-(defun panel--fetch-weather-data (&optional initial force)
-  "Fetch weather data from API.
-INITIAL indicates if this is the first fetch.
-FORCE bypasses cache check."
-  (when (or initial force (panel--active-p))
-    (when (and (not initial) (not force) (panel--weather-cache-valid-p))
-      (message "Panel: Using cached weather data"))
-    (unless (or panel--weather-fetch-in-progress
-                (and (not initial) (not force) (panel--weather-cache-valid-p)))
-      (setq panel--weather-fetch-in-progress t)
-      (let ((url (panel--weather-request-url)))
-        (plz 'get url
-          :as #'json-read
-          :then (lambda (json-obj)
-                  (setq panel--weather-fetch-in-progress nil)
-                  (setq panel--weather-retry-count 0)
-                  (panel--process-weather-json json-obj initial))
-          :else (lambda (err)
-                  (setq panel--weather-fetch-in-progress nil)
-                  (message "Panel: Weather error (attempt %d/%d): %s"
-                           (1+ panel--weather-retry-count)
-                           panel-weather-max-retries err)
-                  (unless (panel--weather-data-available-p)
-                    (setq panel--weather-error-message "Weather unavailable")
-                    (when (panel--active-p)
-                      (panel--refresh-weather-only)))
-                  (when (< panel--weather-retry-count panel-weather-max-retries)
-                    (setq panel--weather-retry-count (1+ panel--weather-retry-count))
-                    (run-with-timer (* 30 panel--weather-retry-count) nil
-                                   #'panel--fetch-weather-data initial force))))))))
+(defun panel--decode-weather-response (status response-buffer)
+  "Return (SUCCESS . VALUE) decoded from STATUS and RESPONSE-BUFFER.
+VALUE is parsed JSON on success and an error message otherwise."
+  (if-let* ((request-error (plist-get status :error)))
+      (cons nil (error-message-string request-error))
+    (cond
+     ((not (buffer-live-p response-buffer))
+      (cons nil "Weather response buffer was lost"))
+     (t
+      (with-current-buffer response-buffer
+        (goto-char (point-min))
+        (if (not (re-search-forward "\r?\n\r?\n" nil t))
+            (cons nil "Malformed HTTP response")
+          (condition-case err
+              (let ((json-object-type 'alist)
+                    (json-key-type 'symbol))
+                (cons t (json-read)))
+            (error
+             (cons nil (error-message-string err))))))))))
+
+(defun panel--dispose-weather-request (request &optional response-buffer)
+  "Release REQUEST and RESPONSE-BUFFER."
+  (when request
+    (when-let* ((timer (aref request 1)))
+      (cancel-timer timer))
+    (let ((request-buffer (aref request 0)))
+      (dolist (response (if (eq request-buffer response-buffer)
+                            (list request-buffer)
+                          (list request-buffer response-buffer)))
+        (when (buffer-live-p response)
+          (when-let* ((process (get-buffer-process response)))
+            (set-process-sentinel process #'ignore)
+            (when (process-live-p process)
+              (delete-process process)))
+          (let ((kill-buffer-query-functions nil))
+            (kill-buffer response)))))
+    (aset request 0 nil)
+    (aset request 1 nil)))
+
+(defun panel--finish-weather-request (request retry-count status response-buffer)
+  "Finish REQUEST at RETRY-COUNT using STATUS and RESPONSE-BUFFER."
+  (let ((current-request (eq request panel--weather-request)))
+    (when current-request
+      (setq panel--weather-request nil))
+    (unwind-protect
+        (when current-request
+          (pcase-let ((`(,success . ,value)
+                       (panel--decode-weather-response status response-buffer)))
+            (if (and success (panel--process-weather-json value))
+                (progn
+                  (when panel--weather-retry-timer
+                    (cancel-timer panel--weather-retry-timer)
+                    (setq panel--weather-retry-timer nil))
+                  (when (panel--active-p)
+                    (panel--refresh-weather-only)))
+              (let ((active (panel--active-p))
+                    (reason (if success
+                                "Missing current weather data"
+                              value)))
+                (setq panel--weather-error-message "Weather unavailable"
+                      panel-temperature nil
+                      panel-weatherdescription nil
+                      panel-weathericon nil)
+                (message "Panel: Weather request failed: %s" reason)
+                (when (and active (< retry-count panel-weather-max-retries))
+                  (let* ((next-retry (1+ retry-count))
+                         (delay (* 30 next-retry)))
+                    (message "Panel: Retrying weather (%d/%d) in %d seconds"
+                             next-retry panel-weather-max-retries delay)
+                    (setq panel--weather-retry-timer
+                          (run-with-timer
+                           delay nil
+                           (lambda ()
+                             (setq panel--weather-retry-timer nil)
+                             (when (panel--active-p)
+                               (panel--fetch-weather-data next-retry)))))))
+                (when active
+                  (panel--refresh-weather-only))))))
+      (panel--dispose-weather-request request response-buffer))))
+
+(defun panel--fetch-weather-data (&optional retry-count)
+  "Fetch weather data with Emacs's built-in URL library.
+RETRY-COUNT belongs to the current request chain."
+  (when (and (null retry-count) panel--weather-retry-timer)
+    (cancel-timer panel--weather-retry-timer)
+    (setq panel--weather-retry-timer nil))
+  (unless panel--weather-request
+    (let* ((retry-count (or retry-count 0))
+           (request (vector nil nil))
+           response-buffer)
+      (setq panel--weather-request request)
+      (let ((url-request-method "GET")
+            (url-request-data nil)
+            (url-request-extra-headers '(("Accept" . "application/json")))
+            (url-request-noninteractive t)
+            (url-http-attempt-keepalives nil)
+            (url-max-redirections 0)
+            (url (format "%s?latitude=%s&longitude=%s&current=temperature_2m,weather_code"
+                         panel-weather-api-base-url
+                         panel-latitude
+                         panel-longitude)))
+        (condition-case err
+            (setq response-buffer
+                  (url-retrieve
+                   url
+                   (lambda (status)
+                     (panel--finish-weather-request
+                      request retry-count status (current-buffer)))
+                   nil
+                   t t))
+          (error
+           (panel--finish-weather-request
+            request retry-count (list :error err) nil)))
+        (when (eq request panel--weather-request)
+          (aset request 0 response-buffer)
+          (if (not (buffer-live-p response-buffer))
+              (panel--finish-weather-request
+               request retry-count
+               '(:error (error "Weather request did not start")) nil)
+            ;; Emacs 27 reads these values after an asynchronous connection.
+            (with-current-buffer response-buffer
+              (setq-local url-http-attempt-keepalives nil
+                          url-max-redirections 0))
+            (aset request 1
+                  (run-with-timer
+                   panel-weather-request-timeout nil
+                   #'panel--finish-weather-request
+                   request retry-count
+                   '(:error (error "Weather request timed out")) nil))))))))
 
 (defun panel--refresh-weather-only ()
   "Only refresh weather information without redrawing entire screen."
@@ -746,26 +796,56 @@ FORCE bypasses cache check."
           (goto-char (min saved-pos (point-max))))))))
 
 (defun panel--cleanup-weather ()
-  "Cancel weather timer and reset state."
+  "Cancel weather work and reset its state."
   (when panel--weather-timer
     (cancel-timer panel--weather-timer)
     (setq panel--weather-timer nil))
-  (setq panel--weather-fetch-in-progress nil)
-  (setq panel--last-weather-update nil)
-  (setq panel--weather-retry-count 0))
+  (when panel--weather-retry-timer
+    (cancel-timer panel--weather-retry-timer)
+    (setq panel--weather-retry-timer nil))
+  (when panel--weather-request
+    (let ((request panel--weather-request))
+      (setq panel--weather-request nil)
+      (panel--dispose-weather-request request)))
+  (setq panel--weather-error-message nil
+        panel-temperature nil
+        panel-weatherdescription nil
+        panel-weathericon nil))
 
 (defun panel--init-weather ()
   "Initialize weather fetching with cleanup."
   (panel--cleanup-weather)
   (when (panel--weather-info-p)
-    (panel--fetch-weather-data t)))
+    (unless (and (integerp panel-weather-update-interval)
+                 (> panel-weather-update-interval 0))
+      (user-error "Weather update interval is not a positive integer: %S"
+                  panel-weather-update-interval))
+    (unless (and (integerp panel-weather-request-timeout)
+                 (> panel-weather-request-timeout 0))
+      (user-error "Weather request timeout is not a positive integer: %S"
+                  panel-weather-request-timeout))
+    (unless (and (integerp panel-weather-max-retries)
+                 (>= panel-weather-max-retries 0))
+      (user-error "Weather retry count is not a nonnegative integer: %S"
+                  panel-weather-max-retries))
+    (setq panel--weather-timer
+          (run-with-timer panel-weather-update-interval
+                          panel-weather-update-interval
+                          (lambda ()
+                            (when (and (panel--active-p)
+                                       (not panel--weather-retry-timer))
+                              (panel--fetch-weather-data)))))
+    (panel--fetch-weather-data)))
 
+;;;###autoload
 (defun panel-refresh ()
   "Manually refresh the panel and weather."
   (interactive)
-  (panel--refresh-screen)
-  (when (panel--weather-info-p)
-    (panel--fetch-weather-data nil t)))
+  (when (and (not (string-empty-p panel-image-file))
+             (file-exists-p panel-image-file))
+    (clear-image-cache panel-image-file))
+  (panel--init-weather)
+  (panel--refresh-screen))
 
 ;;;###autoload
 (defun panel-create-hook ()
@@ -860,6 +940,7 @@ FORCE bypasses cache check."
   (panel--ensure-recentf)
   (setq panel-recentfiles (seq-take recentf-list 9))
   (with-current-buffer (get-buffer-create panel-buffer)
+    (setq panel--padding-cache nil)
     (let* ((image (panel--get-image))
            (size (when image (image-size image)))
            (width (when size (car size)))
