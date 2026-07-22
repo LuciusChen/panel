@@ -1,6 +1,6 @@
 ;;; panel.el --- Minimal startup screen -*- lexical-binding: t -*-
 
-;; Welcome-panel screen
+;; Panel startup screen
 
 ;; Author: Mikael Konradsson <mikael.konradsson@outlook.com>
 ;; Maintainer: Mikael Konradsson <mikael.konradsson@outlook.com>
@@ -15,6 +15,7 @@
 ;;; Minimalistic panel for Emacs.
 
 (require 'cl-lib)
+(require 'eldoc)
 (require 'json)
 (require 'recentf)
 (require 'seq)
@@ -67,7 +68,7 @@
   :type 'string)
 
 (defcustom panel-show-file-path t
-  "Show file path in welcome-panel."
+  "Show file paths in the panel."
   :group 'panel
   :type 'boolean)
 
@@ -80,6 +81,11 @@
   "Maximum path length for display."
   :group 'panel
   :type 'natnum)
+
+(defcustom panel-time-format "%A, %B %d %R"
+  "Format string used to display the panel date and time."
+  :group 'panel
+  :type 'string)
 
 (defcustom panel-latitude nil
   "Latitude for weather information."
@@ -166,7 +172,7 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
   :group 'panel
   :type 'string)
 
-(defconst panel-buffer "*welcome*"
+(defconst panel-buffer "*panel*"
   "Panel buffer name.")
 
 (defvar-local panel--padding-cache nil
@@ -187,6 +193,7 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
 
     (define-key map (kbd "RET") 'panel--open-recent-file)
     (define-key map (kbd "o") 'panel--open-recent-file)
+    (define-key map (kbd "d") 'panel--forget-recent-file)
     (define-key map (kbd "g") 'panel-refresh)
     (define-key map (kbd "r") 'panel-refresh)
 
@@ -203,8 +210,8 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
     map)
   "Keymap for `panel-mode'.")
 
-(define-derived-mode panel-mode special-mode "dashboard"
-  "Major mode for the welcome-panel screen."
+(define-derived-mode panel-mode special-mode "Panel"
+  "Major mode for the panel screen."
   :group 'panel
   :syntax-table nil
   :abbrev-table nil
@@ -216,7 +223,9 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
     (setq-local panel--shortcut-overlay (make-overlay (point-min) (point-min) nil t nil))
     (overlay-put panel--shortcut-overlay 'face 'panel-shortcut-current-face))
   (add-hook 'post-command-hook #'panel--update-shortcut-highlight nil t)
-  (setq-local cursor-type nil))
+  (setq-local cursor-type nil)
+  (setq-local eldoc-documentation-function #'panel--recent-file-at-point)
+  (eldoc-mode 1))
 
 (defface panel-title-face
   '((t :inherit font-lock-constant-face :height 1.3 :italic t))
@@ -550,20 +559,38 @@ This check does not load TRAMP or invoke a file-name handler."
                         (match-end 0))
         (move-overlay panel--shortcut-overlay (point-min) (point-min))))))
 
+(defun panel--recent-file-at-point (&optional property)
+  "Return PROPERTY's value from the recent file on the current line.
+PROPERTY defaults to the full `path' used to open the file."
+  (let ((property (or property 'path))
+        (position (line-beginning-position))
+        (line-end (line-end-position))
+        file)
+    (while (and (< position line-end)
+                (not (setq file
+                           (get-text-property position property))))
+      (setq position (1+ position)))
+    file))
+
 (defun panel--open-recent-file ()
   "Open the recent file on the current line."
   (interactive)
-  (let ((pos (line-beginning-position))
-        (line-end (line-end-position))
-        file)
-    (while (and (< pos line-end)
-                (not (setq file (get-text-property pos 'path))))
-      (setq pos (1+ pos)))
-    (if file
+  (if-let* ((file (panel--recent-file-at-point 'path)))
       (if (file-exists-p file)
           (find-file file)
         (user-error "File does not exist: %s" file))
-      (user-error "No recent file on this line"))))
+    (user-error "No recent file on this line")))
+
+(defun panel--forget-recent-file ()
+  "Remove the recent file on the current line from history."
+  (interactive)
+  (if-let* ((file (panel--recent-file-at-point 'panel--recent-file)))
+      (progn
+        (setq recentf-list (delete file recentf-list))
+        (recentf-save-list)
+        (panel--refresh-screen)
+        (message "Forgot recent file: %s" file))
+    (user-error "No recent file on this line")))
 
 (defun panel--open-recent-file-at-index (index)
   "Open the recent file at the given INDEX in the list."
@@ -613,22 +640,43 @@ This check does not load TRAMP or invoke a file-name handler."
          (display-name (if display-dir
                            (substring display-path (length display-dir))
                          display-path))
-         (path-text (if (and display-dir
-                             (not (string-empty-p display-name)))
-                        (concat (propertize display-dir 'face 'panel-path-face)
-                                (propertize display-name 'face 'panel-filename-face))
-                      (propertize display-path 'face 'panel-filename-face)))
+         (path-text
+          (propertize
+           (if (and display-dir
+                    (not (string-empty-p display-name)))
+               (concat (propertize display-dir 'face 'panel-path-face)
+                       (propertize display-name 'face 'panel-filename-face))
+             (propertize display-path 'face 'panel-filename-face))
+           'help-echo full-path))
          (title (concat icon " " path-text)))
-    (concat (propertize title 'path full-path)
-            (propertize (format " %s" shortcut) 'face 'panel-shortcut-face))))
+    (propertize
+     (concat title
+             (propertize (format " %s" shortcut)
+                         'face 'panel-shortcut-face
+                         'panel--shortcut t))
+     'path full-path
+     'panel--recent-file file)))
 
 (defun panel--insert-recent-files ()
-  "Insert the first x recent files with icons in the panel buffer."
-  (let ((left-margin (panel--calculate-padding-left)))
+  "Insert recent files with their shortcuts aligned."
+  (let ((left-margin (panel--calculate-padding-left))
+        (title-width
+         (cl-loop for line in panel--recent-file-lines
+                  for shortcut-start =
+                  (text-property-any 0 (length line)
+                                     'panel--shortcut t line)
+                  maximize (string-width
+                            (substring line 0 shortcut-start)))))
     (dolist (line panel--recent-file-lines)
-      (insert (make-string left-margin ?\s))
-      (insert line)
-      (insert "\n"))))
+      (let* ((shortcut-start
+              (text-property-any 0 (length line)
+                                 'panel--shortcut t line))
+             (title (substring line 0 shortcut-start)))
+        (insert (make-string left-margin ?\s))
+        (insert title)
+        (insert (make-string (- title-width (string-width title)) ?\s))
+        (insert (substring line shortcut-start))
+        (insert "\n")))))
 
 (defun panel--calculate-padding-left ()
   "Calculate padding for left side."
@@ -1024,7 +1072,9 @@ RETRY-COUNT belongs to the current request chain."
         (panel--insert-weather-info)
 
         (insert "\n")
-        (panel--insert-centered (propertize (format-time-string "%A, %B %d %R") 'face 'panel-time-face))
+        (panel--insert-centered
+         (propertize (format-time-string panel-time-format)
+                     'face 'panel-time-face))
 
         (switch-to-buffer panel-buffer)
         (goto-char (point-min))

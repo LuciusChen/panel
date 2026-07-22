@@ -22,11 +22,16 @@
       (cl-letf (((symbol-function 'panel--file-icon) (lambda (_) "I")))
         (let* ((line (panel--recent-file-line file 1))
                (plain (substring-no-properties line))
+               (full-path (expand-file-name file))
                (path (string-remove-prefix
                       "I " (string-remove-suffix " [1]" plain))))
           (should (<= (string-width path) panel-path-max-length))
-          (should (equal (get-text-property 0 'path line)
-                         (expand-file-name file))))))))
+          (should (equal (get-text-property 0 'path line) full-path))
+          (should (equal (get-text-property 0 'panel--recent-file line) file))
+          (should-not (get-text-property 0 'help-echo line))
+          (should (equal (get-text-property 2 'help-echo line) full-path))
+          (should-not
+           (get-text-property (1- (length line)) 'help-echo line)))))))
 
 (ert-deftest panel-test-remote-recent-path-does-not-probe-filesystem ()
   (let* ((file "/ssh:test@example.invalid:/tmp/example.org/")
@@ -40,8 +45,103 @@
                 file-name-handler-alist)))
     (let ((line (panel--recent-file-line file 1)))
       (should (stringp line))
-      (should (equal (get-text-property 0 'path line) file)))
+      (should (equal (get-text-property 0 'path line) file))
+      (should (equal (get-text-property 0 'panel--recent-file line) file))
+      (should
+       (cl-loop for position below (length line)
+                thereis (equal (get-text-property position 'help-echo line)
+                               file))))
     (should-not handler-called)))
+
+(ert-deftest panel-test-recent-file-shortcuts-align ()
+  (let ((panel-use-icons nil)
+        (panel-show-file-path nil))
+    (let ((lines (list (panel--recent-file-line "/tmp/a.el" 1)
+                       (panel--recent-file-line
+                        "/tmp/a-much-longer-file-name.el" 2))))
+      (with-temp-buffer
+        (setq panel--recent-file-lines lines)
+        (cl-letf (((symbol-function 'panel--calculate-padding-left)
+                   (lambda () 0)))
+          (panel--insert-recent-files))
+        (goto-char (point-min))
+        (search-forward "[1]")
+        (goto-char (match-beginning 0))
+        (let ((first-column (current-column)))
+          (forward-line 1)
+          (search-forward "[2]")
+          (goto-char (match-beginning 0))
+          (should (= (current-column) first-column)))))))
+
+(ert-deftest panel-test-recent-file-at-point-is-line-bounded ()
+  (with-temp-buffer
+    (insert "Panel heading\n  "
+            (propertize "file [1]"
+                        'path "/tmp/full-file"
+                        'panel--recent-file "/tmp/file"))
+    (panel-mode)
+    (should eldoc-mode)
+    (should (local-variable-p 'eldoc-documentation-function))
+    (should (eq eldoc-documentation-function
+                #'panel--recent-file-at-point))
+    (goto-char (point-min))
+    (should-not (panel--recent-file-at-point))
+    (forward-line 1)
+    (end-of-line)
+    (should (equal (panel--recent-file-at-point) "/tmp/full-file"))
+    (should (equal (panel--recent-file-at-point 'panel--recent-file)
+                   "/tmp/file"))))
+
+(ert-deftest panel-test-open-recent-file-uses-rendered-full-path ()
+  (let* ((file (make-temp-file "panel-open-"))
+         (entry (file-relative-name file default-directory))
+         (panel-use-icons nil)
+         (line (panel--recent-file-line entry 1))
+         (full-path (get-text-property 0 'path line))
+         opened-file)
+    (unwind-protect
+        (with-temp-buffer
+          (insert line)
+          (goto-char (point-min))
+          (let ((default-directory temporary-file-directory))
+            (cl-letf (((symbol-function 'find-file)
+                       (lambda (target) (setq opened-file target))))
+              (panel--open-recent-file)))
+          (should (equal opened-file full-path)))
+      (delete-file file))))
+
+(ert-deftest panel-test-forget-recent-file-updates-history-only ()
+  (let* ((file (make-temp-file "panel-forget-"))
+         (entry (file-relative-name file default-directory))
+         (file-regexp (concat "\\`\\(?:" (regexp-quote entry) "\\|"
+                              (regexp-quote file) "\\)\\'"))
+         (other "/tmp/other-file")
+         (recentf-list (list entry other))
+         (panel-use-icons nil)
+         saved-list
+         refreshed)
+    (unwind-protect
+        (with-temp-buffer
+          (insert "  " (panel--recent-file-line entry 1))
+          (goto-char (point-min))
+          (cl-letf (((symbol-function 'recentf-save-list)
+                     (lambda () (setq saved-list (copy-sequence recentf-list))))
+                    ((symbol-function 'panel--refresh-screen)
+                     (lambda () (setq refreshed t))))
+            (let ((file-name-handler-alist
+                   (cons (cons file-regexp
+                               (lambda (&rest _)
+                                 (error "Unexpected file operation")))
+                         file-name-handler-alist)))
+              (panel--forget-recent-file)))
+          (should (equal recentf-list (list other)))
+          (should (equal saved-list (list other)))
+          (should-not (equal entry (expand-file-name entry)))
+          (should refreshed)
+          (should (file-exists-p file))
+          (should (eq (lookup-key panel-mode-map (kbd "d"))
+                      'panel--forget-recent-file)))
+      (delete-file file))))
 
 (ert-deftest panel-test-recentf-initialization-avoids-tramp ()
   (let ((recentf-mode nil)
@@ -90,6 +190,7 @@
   (let ((recentf-list '("/tmp/first.el" "/tmp/second.org"))
         (panel-recentfiles nil)
         (panel-title "Recent files")
+        (panel-time-format "CUSTOM-TIME")
         (panel-intro-display 'never)
         (panel-image-file "")
         (panel-latitude nil)
@@ -102,14 +203,20 @@
                   ((symbol-function 'panel--recent-file-line)
                    (lambda (file index)
                      (push (cons file index) calls)
-                     (format "%s [%d]" file index))))
+                     (concat file
+                             (propertize (format " [%d]" index)
+                                         'panel--shortcut t)))))
           (panel--refresh-screen)
           (should (equal (nreverse calls)
                          '(("/tmp/first.el" . 1)
                            ("/tmp/second.org" . 2))))
           (with-current-buffer panel-buffer
+            (should (equal (buffer-name) "*panel*"))
             (should (eq major-mode 'panel-mode))
-            (should (= (length panel--recent-file-lines) 2))))
+            (should (equal mode-name "Panel"))
+            (should (= (length panel--recent-file-lines) 2))
+            (goto-char (point-min))
+            (should (search-forward "CUSTOM-TIME" nil t))))
       (when (get-buffer panel-buffer)
         (kill-buffer panel-buffer)))))
 
