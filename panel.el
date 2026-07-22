@@ -659,24 +659,34 @@ PROPERTY defaults to the full `path' used to open the file."
 
 (defun panel--insert-recent-files ()
   "Insert recent files with their shortcuts aligned."
-  (let ((left-margin (panel--calculate-padding-left))
-        (title-width
-         (cl-loop for line in panel--recent-file-lines
-                  for shortcut-start =
-                  (text-property-any 0 (length line)
-                                     'panel--shortcut t line)
-                  maximize (string-width
-                            (substring line 0 shortcut-start)))))
-    (dolist (line panel--recent-file-lines)
-      (let* ((shortcut-start
-              (text-property-any 0 (length line)
-                                 'panel--shortcut t line))
-             (title (substring line 0 shortcut-start)))
-        (insert (make-string left-margin ?\s))
-        (insert title)
-        (insert (make-string (- title-width (string-width title)) ?\s))
-        (insert (substring line shortcut-start))
-        (insert "\n")))))
+  (when panel--recent-file-lines
+    (let ((left-margin (panel--calculate-padding-left))
+          (block-start (point)))
+      (dolist (line panel--recent-file-lines)
+        (let ((shortcut-start
+               (text-property-any 0 (length line)
+                                  'panel--shortcut t line)))
+          (insert (make-string left-margin ?\s))
+          (insert (substring line 0 shortcut-start))
+          (insert "\n")))
+      ;; Column counts do not reflect the rendered widths of faces and icons.
+      (let ((shortcut-x
+             (+ (car (window-text-pixel-size
+                      (selected-window) block-start (point)
+                      (frame-pixel-width)))
+                (frame-char-width))))
+        (save-excursion
+          (goto-char block-start)
+          (dolist (line panel--recent-file-lines)
+            (let ((shortcut-start
+                   (text-property-any 0 (length line)
+                                      'panel--shortcut t line)))
+              (end-of-line)
+              (insert (propertize
+                       (substring line shortcut-start (1+ shortcut-start))
+                       'display `(space :align-to (,shortcut-x))))
+              (insert (substring line (1+ shortcut-start)))
+              (forward-line 1))))))))
 
 (defun panel--calculate-padding-left ()
   "Calculate padding for left side."
@@ -1035,6 +1045,7 @@ RETRY-COUNT belongs to the current request chain."
           (cl-loop for file in panel-recentfiles
                    for index from 1
                    collect (panel--recent-file-line file index)))
+    (switch-to-buffer panel-buffer)
     (let* ((image (panel--get-image))
            (size (when image (image-size image)))
            (width (when size (car size)))
@@ -1076,7 +1087,6 @@ RETRY-COUNT belongs to the current request chain."
          (propertize (format-time-string panel-time-format)
                      'face 'panel-time-face))
 
-        (switch-to-buffer panel-buffer)
         (goto-char (point-min))
         (if (re-search-forward " \\[[1-9]\\]" nil t)
             (beginning-of-line)

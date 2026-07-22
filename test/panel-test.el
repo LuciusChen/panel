@@ -54,24 +54,33 @@
     (should-not handler-called)))
 
 (ert-deftest panel-test-recent-file-shortcuts-align ()
-  (let ((panel-use-icons nil)
-        (panel-show-file-path nil))
-    (let ((lines (list (panel--recent-file-line "/tmp/a.el" 1)
-                       (panel--recent-file-line
-                        "/tmp/a-much-longer-file-name.el" 2))))
-      (with-temp-buffer
-        (setq panel--recent-file-lines lines)
-        (cl-letf (((symbol-function 'panel--calculate-padding-left)
-                   (lambda () 0)))
-          (panel--insert-recent-files))
-        (goto-char (point-min))
-        (search-forward "[1]")
-        (goto-char (match-beginning 0))
-        (let ((first-column (current-column)))
-          (forward-line 1)
-          (search-forward "[2]")
-          (goto-char (match-beginning 0))
-          (should (= (current-column) first-column)))))))
+  (with-temp-buffer
+    (save-window-excursion
+      (switch-to-buffer (current-buffer))
+      (setq panel--recent-file-lines
+            (list (concat "iiii"
+                          (propertize " [1]" 'panel--shortcut t))
+                  (concat "WWWW"
+                          (propertize " [2]" 'panel--shortcut t))))
+      (cl-letf (((symbol-function 'panel--calculate-padding-left)
+                 (lambda () 0))
+                ((symbol-function 'window-text-pixel-size)
+                 (lambda (window from to _x-limit &rest _)
+                   (should (eq (window-buffer window) (current-buffer)))
+                   (should (equal (buffer-substring-no-properties from to)
+                                  "iiii\nWWWW\n"))
+                   '(73 . 20)))
+                ((symbol-function 'frame-char-width)
+                 (lambda (&optional _frame) 7)))
+        (panel--insert-recent-files))
+      (goto-char (point-min))
+      (let (alignments)
+        (while (re-search-forward "\\[[12]\\]" nil t)
+          (push (get-text-property (1- (match-beginning 0)) 'display)
+                alignments))
+        (should (equal alignments
+                       '((space :align-to (80))
+                         (space :align-to (80)))))))))
 
 (ert-deftest panel-test-recent-file-at-point-is-line-bounded ()
   (with-temp-buffer
