@@ -423,13 +423,7 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
            (version (propertize
                      (format "v%d.%d" emacs-major-version emacs-minor-version)
                      'face 'panel-intro-version-face))
-           (composed-lines
-            (cl-loop for line in raw-lines
-                     for index from 0
-                     collect (if (= index (1- (length raw-lines)))
-                                 (concat line "  " version)
-                               line)))
-           (left-padding (panel--block-left-padding composed-lines
+           (left-padding (panel--block-left-padding raw-lines
                                                    panel-intro-horizontal-offset))
            (last-index (1- (length raw-lines)))
            (index 0))
@@ -1047,14 +1041,6 @@ RETRY-COUNT belongs to the current request chain."
                    collect (panel--recent-file-line file index)))
     (switch-to-buffer panel-buffer)
     (let* ((image (panel--get-image))
-           (size (when image (image-size image)))
-           (width (when size (car size)))
-           (left-margin (max 0
-                             (+ (if width
-                                    (max panel-min-left-padding
-                                         (floor (/ (- (window-width) width) 2)))
-                                  panel-min-left-padding)
-                                panel-intro-horizontal-offset)))
            (packages (format "%d" (panel--package-length))))
       (let ((inhibit-read-only t))
         (erase-buffer)
@@ -1064,10 +1050,21 @@ RETRY-COUNT belongs to the current request chain."
           (panel--insert-text (propertize panel-title 'face 'panel-title-face))
           (insert "\n"))
         (when image
-          (insert "\n")
-          (insert (make-string left-margin ?\ ))
-          (insert-image image)
-          (insert "\n\n"))
+          (let* ((char-width (frame-char-width))
+                 (left-margin
+                  (max 0
+                       (+ (max (* panel-min-left-padding char-width)
+                               (floor
+                                (/ (- (window-body-width nil t)
+                                      (car (image-size image t)))
+                                   2)))
+                          (* panel-intro-horizontal-offset char-width)))))
+            (insert "\n")
+            (insert (propertize
+                     " "
+                     'display `(space :align-to (,left-margin))))
+            (insert-image image)
+            (insert "\n\n")))
 
         (when (and (not image)
                    (panel--intro-visible-p))
