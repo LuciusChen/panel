@@ -9,6 +9,7 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'subr-x)
+(require 'wid-edit)
 
 (add-to-list 'load-path
              (expand-file-name ".." (file-name-directory
@@ -90,14 +91,15 @@
                         'panel--recent-file "/tmp/file"))
     (panel-mode)
     (should eldoc-mode)
-    (should (local-variable-p 'eldoc-documentation-function))
-    (should (eq eldoc-documentation-function
-                #'panel--recent-file-at-point))
+    (should (local-variable-p 'eldoc-documentation-functions))
+    (should (member #'panel--recent-file-eldoc eldoc-documentation-functions))
     (goto-char (point-min))
     (should-not (panel--recent-file-at-point))
+    (should-not (panel--recent-file-eldoc #'ignore))
     (forward-line 1)
     (end-of-line)
     (should (equal (panel--recent-file-at-point) "/tmp/full-file"))
+    (should (equal (panel--recent-file-eldoc #'ignore) "/tmp/full-file"))
     (should (equal (panel--recent-file-at-point 'panel--recent-file)
                    "/tmp/file"))))
 
@@ -197,7 +199,7 @@
 
 (ert-deftest panel-test-recent-files-render-each-line-once ()
   (let ((recentf-list '("/tmp/first.el" "/tmp/second.org"))
-        (panel-recentfiles nil)
+        (panel--recent-files nil)
         (panel-title "Recent files")
         (panel-time-format "CUSTOM-TIME")
         (panel-intro-display 'never)
@@ -260,13 +262,13 @@
 
 (ert-deftest panel-test-weather-json-accepts-only-requested-schema ()
   (let ((panel-use-icons nil)
-        panel-temperature
-        panel-weatherdescription
-        panel-weathericon)
+        panel--temperature
+        panel--weather-description
+        panel--weather-icon)
     (panel--process-weather-json
      '((current . ((temperature_2m . 21.25) (weather_code . 0)))))
-    (should (equal panel-temperature "21.2"))
-    (should (equal panel-weatherdescription "Clear sky"))
+    (should (equal panel--temperature "21.2"))
+    (should (equal panel--weather-description "Clear sky"))
     (should-not
      (panel--process-weather-json
       '((current_weather . ((temperature . 21.25) (weathercode . 0))))))))
@@ -341,17 +343,17 @@
           (funcall callback nil)))
       (should-not (buffer-live-p request-buffer))
       (should-not panel--weather-request)
-      (should (equal panel-temperature "18.5"))
-      (should (equal panel-weatherdescription "Partly cloudy")))))
+      (should (equal panel--temperature "18.5"))
+      (should (equal panel--weather-description "Partly cloudy")))))
 
 (ert-deftest panel-test-url-timeout-aborts-and-cleans-request ()
   (let ((panel-latitude 1.0)
         (panel-longitude 2.0)
         (panel-weather-request-timeout 15)
         (panel-weather-max-retries 0)
-        (panel-temperature "old")
-        (panel-weatherdescription "old")
-        (panel-weathericon "old")
+        (panel--temperature "old")
+        (panel--weather-description "old")
+        (panel--weather-icon "old")
         panel--weather-request
         panel--weather-retry-timer
         timeout-function
@@ -370,9 +372,9 @@
       (should-not panel--weather-request)
       (should-not (buffer-live-p request-buffer))
       (should (equal panel--weather-error-message "Weather unavailable"))
-      (should-not panel-temperature)
-      (should-not panel-weatherdescription)
-      (should-not panel-weathericon))))
+      (should-not panel--temperature)
+      (should-not panel--weather-description)
+      (should-not panel--weather-icon))))
 
 (ert-deftest panel-test-url-start-and-parse-errors-stay-contained ()
   (let ((panel-latitude 1.0)
@@ -446,7 +448,7 @@
         (should-error (funcall callback nil) :type 'error))
       (should-not panel--weather-request)
       (should-not (buffer-live-p response-buffer))
-      (should (equal panel-temperature "18.5"))
+      (should (equal panel--temperature "18.5"))
       (should-not panel--weather-retry-timer))))
 
 (ert-deftest panel-test-weather-retry-precedes-rendering ()
@@ -559,13 +561,13 @@
         (panel--fetch-weather-data)
         (let ((new-request panel--weather-request)
               (late-buffer (generate-new-buffer " *panel-test-late-response*")))
-          (setq panel-temperature "new")
+          (setq panel--temperature "new")
           (with-current-buffer late-buffer
             (insert "HTTP/1.1 200 OK\r\n\r\n"
                     "{\"current\":{\"temperature_2m\":99,\"weather_code\":0}}")
             (funcall old-callback nil))
           (should (eq panel--weather-request new-request))
-          (should (equal panel-temperature "new"))
+          (should (equal panel--temperature "new"))
           (should-not (buffer-live-p late-buffer))))
       (panel--cleanup-weather))))
 
@@ -600,6 +602,95 @@
             (should-not (equal panel--padding-cache 999))))
       (when (get-buffer panel-buffer)
         (kill-buffer panel-buffer)))))
+
+(ert-deftest panel-test-weather-timing-custom-types-require-positive ()
+  (dolist (symbol '(panel-weather-update-interval
+                    panel-weather-request-timeout))
+    (let ((widget (widget-convert (get symbol 'custom-type))))
+      (should (widget-apply widget :match 900))
+      (should-not (widget-apply widget :match 0))
+      (should-not (widget-apply widget :match -5))
+      (should-not (widget-apply widget :match 1.5)))))
+
+(ert-deftest panel-test-weather-code-table-is-well-formed ()
+  (dolist (entry panel--weather-code-table)
+    (pcase-let ((`(,codes ,description ,icon ,fallback) entry))
+      (should (consp codes))
+      (should (cl-every #'integerp codes))
+      (should (stringp description))
+      ;; Wicon names use underscores; a hyphen after the prefix is a typo
+      ;; that makes `nerd-icons-wicon' signal an error.
+      (should (string-match-p "\\`nf-weather-[a-z_]+\\'" icon))
+      (should (stringp fallback)))))
+
+(ert-deftest panel-test-weather-code-mapping-degrades-gracefully ()
+  (let ((panel-use-icons nil))
+    (should (equal (panel--weather-code-to-string 66) "Freezing rain"))
+    (should (equal (panel--weather-icon-from-code 66) "rain"))
+    (should (equal (panel--weather-code-to-string 100) "Unknown"))
+    (should (equal (panel--weather-icon-from-code 100) "")))
+  (cl-letf (((symbol-function 'panel--with-icon-fallback)
+             (lambda (_fn icon _fallback &rest _) (concat "W:" icon))))
+    (should (equal (panel--weather-icon-from-code 85)
+                   "W:nf-weather-rain_mix"))
+    (should (equal (panel--weather-icon-from-code 100) ""))))
+
+(ert-deftest panel-test-open-recent-file-by-key-uses-basic-event ()
+  (let ((panel--recent-files '("/tmp/one" "/tmp/two" "/tmp/three"))
+        opened)
+    (cl-letf (((symbol-function 'find-file)
+               (lambda (file) (setq opened file)))
+              ((symbol-function 'file-exists-p) (lambda (_) t)))
+      (dolist (event (list ?3 (event-convert-list '(meta super ?3))))
+        (setq opened nil)
+        (let ((last-command-event event))
+          (panel--open-recent-file-by-key))
+        (should (equal opened "/tmp/three"))))
+    (let ((last-command-event ?9))
+      (should-error (panel--open-recent-file-by-key) :type 'user-error))))
+
+(ert-deftest panel-test-shortcut-highlight-ignores-lookalike-text ()
+  (with-temp-buffer
+    (insert "lookalike [2].org"
+            (propertize " [1]" 'panel--shortcut t)
+            "\n")
+    (panel-mode)
+    (goto-char (point-min))
+    (panel--update-shortcut-highlight)
+    (should (equal (buffer-substring-no-properties
+                    (overlay-start panel--shortcut-overlay)
+                    (overlay-end panel--shortcut-overlay))
+                   "[1]"))
+    (forward-line 1)
+    (panel--update-shortcut-highlight)
+    (should (= (overlay-start panel--shortcut-overlay) (point-min)))))
+
+(ert-deftest panel-test-refresh-renders-in-panel-window-without-stealing ()
+  (let ((recentf-list '("/tmp/first.el"))
+        (panel--recent-files nil)
+        (panel-title "Recent files")
+        (panel-intro-display 'never)
+        (panel-image-file "")
+        (panel-latitude nil)
+        (panel-longitude nil)
+        (panel-use-icons nil)
+        (other-buffer (generate-new-buffer " *panel-test-other*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer other-buffer)
+          (let ((panel-window (split-window)))
+            (set-window-buffer panel-window (get-buffer-create panel-buffer))
+            (cl-letf (((symbol-function 'panel--ensure-recentf) #'ignore)
+                      ((symbol-function 'panel--package-length) (lambda () 0)))
+              (panel--refresh-screen))
+            (should (eq (window-buffer (selected-window)) other-buffer))
+            (should (eq (window-buffer panel-window) (get-buffer panel-buffer)))
+            (with-current-buffer panel-buffer
+              (goto-char (point-min))
+              (should (search-forward "first.el" nil t)))))
+      (when (get-buffer panel-buffer)
+        (kill-buffer panel-buffer))
+      (kill-buffer other-buffer))))
 
 (provide 'panel-test)
 ;;; panel-test.el ends here

@@ -16,7 +16,7 @@ A small Emacs startup panel focused on recent files, startup info, and optional 
 
 ## Requirements
 
-- Emacs 27.1+
+- Emacs 28.1+
 - [`nerd-icons`](https://github.com/rainstormstudio/nerd-icons.el) for file and
   status icons (optional but recommended)
 

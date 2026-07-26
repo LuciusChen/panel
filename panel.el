@@ -6,7 +6,7 @@
 ;; Maintainer: Mikael Konradsson <mikael.konradsson@outlook.com>
 ;; Created: 2023
 ;; Version: 0.2
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "28.1"))
 ;; URL: https://github.com/LuciusChen/panel
 ;; Assisted-by: OpenAI Codex
 
@@ -36,16 +36,16 @@
   "Panel group."
   :group 'applications)
 
-(defvar panel-recentfiles nil
+(defvar panel--recent-files nil
   "Recent files currently rendered by the panel.")
 
-(defvar panel-temperature nil
+(defvar panel--temperature nil
   "Current weather temperature as a display string.")
 
-(defvar panel-weatherdescription nil
+(defvar panel--weather-description nil
   "Current weather description as a display string.")
 
-(defvar panel-weathericon nil
+(defvar panel--weather-icon nil
   "Current weather icon as a display string.")
 (defvar panel--weather-error-message nil
   "Last weather error message, if any.")
@@ -148,12 +148,16 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
   :group 'panel
   :type 'boolean)
 
+(defun panel--positive-integer-p (value)
+  "Return non-nil when VALUE is a positive integer."
+  (and (integerp value) (> value 0)))
+
 (defcustom panel-weather-update-interval 900
-  "Interval in seconds between weather updates."
+  "Interval in seconds between weather updates.
+Must be a positive integer."
   :group 'panel
-  :type '(integer :tag "Positive integer"
-                  :match-alternatives
-                  ((lambda (value) (and (integerp value) (> value 0))))))
+  :type '(restricted-sexp :tag "Positive integer"
+                          :match-alternatives (panel--positive-integer-p)))
 
 (defcustom panel-weather-max-retries 3
   "Maximum number of retry attempts for weather fetch."
@@ -161,11 +165,11 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
   :type 'natnum)
 
 (defcustom panel-weather-request-timeout 15
-  "Seconds before aborting a weather request."
+  "Seconds before aborting a weather request.
+Must be a positive integer."
   :group 'panel
-  :type '(integer :tag "Positive integer"
-                  :match-alternatives
-                  ((lambda (value) (and (integerp value) (> value 0))))))
+  :type '(restricted-sexp :tag "Positive integer"
+                          :match-alternatives (panel--positive-integer-p)))
 
 (defcustom panel-weather-api-base-url "https://api.open-meteo.com/v1/forecast"
   "Base URL for weather requests."
@@ -191,21 +195,17 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
 
-    (define-key map (kbd "RET") 'panel--open-recent-file)
-    (define-key map (kbd "o") 'panel--open-recent-file)
-    (define-key map (kbd "d") 'panel--forget-recent-file)
-    (define-key map (kbd "g") 'panel-refresh)
-    (define-key map (kbd "r") 'panel-refresh)
+    (define-key map (kbd "RET") #'panel--open-recent-file)
+    (define-key map (kbd "o") #'panel--open-recent-file)
+    (define-key map (kbd "d") #'panel--forget-recent-file)
+    (define-key map (kbd "g") #'panel-refresh)
+    (define-key map (kbd "r") #'panel-refresh)
 
     (dolist (i (number-sequence 1 9))
       (define-key map (kbd (number-to-string i))
-                  `(lambda ()
-                     (interactive)
-                     (panel--open-recent-file-at-index ,i)))
+                  #'panel--open-recent-file-by-key)
       (define-key map (kbd (concat "M-s-" (number-to-string i)))
-                  `(lambda ()
-                     (interactive)
-                     (panel--open-recent-file-at-index ,i))))
+                  #'panel--open-recent-file-by-key))
 
     map)
   "Keymap for `panel-mode'.")
@@ -224,17 +224,12 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
     (overlay-put panel--shortcut-overlay 'face 'panel-shortcut-current-face))
   (add-hook 'post-command-hook #'panel--update-shortcut-highlight nil t)
   (setq-local cursor-type nil)
-  (setq-local eldoc-documentation-function #'panel--recent-file-at-point)
+  (add-hook 'eldoc-documentation-functions #'panel--recent-file-eldoc nil t)
   (eldoc-mode 1))
 
 (defface panel-title-face
   '((t :inherit font-lock-constant-face :height 1.3 :italic t))
   "Title face."
-  :group 'panel)
-
-(defface panel-subtitle-face
-  '((t :foreground "#9399b2"))
-  "Subtitle face."
   :group 'panel)
 
 (defface panel-intro-face
@@ -329,33 +324,33 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
       (apply fn icon args)
     fallback))
 
+(defconst panel--weather-code-table
+  '(((0)        "Clear sky"        "nf-weather-day_sunny"    "sun")
+    ((1 2 3)    "Partly cloudy"    "nf-weather-cloudy"       "cloud")
+    ((45 48)    "Fog"              "nf-weather-fog"          "fog")
+    ((51 53 55) "Drizzle"          "nf-weather-sleet"        "drizzle")
+    ((56 57)    "Freezing drizzle" "nf-weather-snow"         "drizzle")
+    ((61 63 65) "Rain"             "nf-weather-day_rain_mix" "rain")
+    ((66 67)    "Freezing rain"    "nf-weather-rain_mix"     "rain")
+    ((71 73 75) "Snowfall"         "nf-weather-snow"         "snow")
+    ((77)       "Snow grains"      "nf-weather-snow"         "snow")
+    ((80 81 82) "Rain showers"     "nf-weather-rain"         "rain")
+    ((85 86)    "Snow showers"     "nf-weather-rain_mix"     "snow")
+    ((95 96 99) "Thunderstorm"     "nf-weather-thunderstorm" "storm"))
+  "Open-Meteo weather codes as (CODES DESCRIPTION ICON-NAME TEXT-FALLBACK).")
+
+(defun panel--weather-code-entry (code)
+  "Return the `panel--weather-code-table' entry that contains CODE."
+  (seq-find (lambda (entry) (memq code (car entry)))
+            panel--weather-code-table))
+
 (defun panel--weather-icon-from-code (code)
-  "Map weather CODE to a corresponding string."
-  (panel--with-icon-fallback
-   #'nerd-icons-wicon
-   (pcase code
-     (`0 "nf-weather-day_sunny")
-     ((or `1 `2 `3) "nf-weather-cloudy")
-     ((or `45 `48) "nf-weather-fog")
-     ((or `51 `53 `55) "nf-weather-sleet")
-     ((or `56 `57) "nf-weather-snow")
-     ((or `61 `63 `65) "nf-weather-day_rain_mix")
-     ((or `66 `67) "nf-weather-rain-mix")
-     ((or `71 `73 `75) "nf-weather-snow")
-     (`77 "nf-weather-snow")
-     ((or `80 `81 `82) "nf-weather-rain")
-     ((or `85 `86) "nf-weather-rain-mix")
-     ((or `95 `96 `99) "nf-weather-thunderstorm")
-     (_ "Unknown"))
-   (pcase code
-     (`0 "sun")
-     ((or `1 `2 `3) "cloud")
-     ((or `45 `48) "fog")
-     ((or `51 `53 `55 `56 `57) "drizzle")
-     ((or `61 `63 `65 `66 `67 `80 `81 `82) "rain")
-     ((or `71 `73 `75 `77 `85 `86) "snow")
-     ((or `95 `96 `99) "storm")
-     (_ ""))))
+  "Map weather CODE to an icon string, empty when CODE is unknown."
+  (pcase-let ((`(,_codes ,_description ,icon ,fallback)
+               (panel--weather-code-entry code)))
+    (if icon
+        (panel--with-icon-fallback #'nerd-icons-wicon icon fallback)
+      "")))
 
 (defun panel--block-width (lines)
   "Return the maximum display width of LINES."
@@ -443,21 +438,8 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
     (insert "\n")))
 
 (defun panel--weather-code-to-string (code)
-  "Map weather CODE to a corresponding string."
-  (pcase code
-    (`0 "Clear sky")
-    ((or `1 `2 `3) "Partly cloudy")
-    ((or `45 `48) "Fog")
-    ((or `51 `53 `55) "Drizzle")
-    ((or `56 `57) "Freezing drizzle")
-    ((or `61 `63 `65) "Rain")
-    ((or `66 `67) "Freezing rain")
-    ((or `71 `73 `75) "Snowfall")
-    (`77 "Snow grains")
-    ((or `80 `81 `82) "Rain showers")
-    ((or `85 `86) "Snow showers")
-    ((or `95 `96 `99) "Thunderstorm")
-    (_ "Unknown")))
+  "Map weather CODE to a human-readable description."
+  (or (nth 1 (panel--weather-code-entry code)) "Unknown"))
 
 (defun panel--insert-centered (text)
   "Insert TEXT at the center of the current line."
@@ -494,10 +476,7 @@ Each entry is a cons cell of the form (KEY . DESCRIPTION)."
            file-name-handler-alist)))
     (unless recentf-mode
       (recentf-mode 1))
-    (unless (bound-and-true-p recentf-list)
-      (setq recentf-list nil))
-    (when (and (boundp 'recentf-list)
-               (not recentf-list))
+    (unless recentf-list
       (recentf-load-list))
     (when (and initialize-history (not file-name-history))
       (setq file-name-history (mapcar #'abbreviate-file-name recentf-list)))))
@@ -545,12 +524,16 @@ This check does not load TRAMP or invoke a file-name handler."
 (defun panel--update-shortcut-highlight ()
   "Highlight the shortcut on the current line."
   (when (overlayp panel--shortcut-overlay)
-    (save-excursion
-      (beginning-of-line)
-      (if (re-search-forward " \\[[1-9]\\]" (line-end-position) t)
+    (let* ((start (line-beginning-position))
+           (end (line-end-position))
+           (shortcut-start (text-property-any start end 'panel--shortcut t)))
+      (if shortcut-start
+          ;; Skip the leading alignment space of the shortcut run.
           (move-overlay panel--shortcut-overlay
-                        (1+ (match-beginning 0))
-                        (match-end 0))
+                        (1+ shortcut-start)
+                        (or (text-property-not-all shortcut-start end
+                                                   'panel--shortcut t)
+                            end))
         (move-overlay panel--shortcut-overlay (point-min) (point-min))))))
 
 (defun panel--recent-file-at-point (&optional property)
@@ -565,6 +548,10 @@ PROPERTY defaults to the full `path' used to open the file."
                            (get-text-property position property))))
       (setq position (1+ position)))
     file))
+
+(defun panel--recent-file-eldoc (_callback &rest _)
+  "Return the recent file path on the current line for ElDoc."
+  (panel--recent-file-at-point))
 
 (defun panel--open-recent-file ()
   "Open the recent file on the current line."
@@ -589,12 +576,18 @@ PROPERTY defaults to the full `path' used to open the file."
 (defun panel--open-recent-file-at-index (index)
   "Open the recent file at the given INDEX in the list."
   (interactive "nIndex: ")
-  (let ((files panel-recentfiles))
-    (when (<= 1 index (length files))
-      (let ((file (nth (1- index) files)))
-        (if (file-exists-p file)
-            (find-file file)
-          (user-error "File does not exist: %s" file))))))
+  (unless (<= 1 index (length panel--recent-files))
+    (user-error "No recent file at index %d" index))
+  (let ((file (nth (1- index) panel--recent-files)))
+    (if (file-exists-p file)
+        (find-file file)
+      (user-error "File does not exist: %s" file))))
+
+(defun panel--open-recent-file-by-key ()
+  "Open the recent file selected by the digit key that invoked this command."
+  (interactive)
+  (panel--open-recent-file-at-index
+   (- (event-basic-type last-command-event) ?0)))
 
 (defun panel--truncate-path-in-middle (path n)
   "Truncate the middle of PATH to length N with an ellipsis."
@@ -704,14 +697,15 @@ PROPERTY defaults to the full `path' used to open the file."
     (insert (format "%s%s\n" (make-string left-margin ?\s) text))))
 
 (defun panel--redisplay-buffer-on-resize (&rest _)
-  "Resize current buffer with debouncing."
-  (when (equal (buffer-name) panel-buffer)
+  "Schedule a debounced panel refresh after a window layout change."
+  (when (get-buffer-window panel-buffer)
     (when panel--resize-timer
       (cancel-timer panel--resize-timer))
     (setq panel--resize-timer
           (run-with-idle-timer 0.2 nil
                                (lambda ()
-                                 (when (get-buffer-window panel-buffer)
+                                 (setq panel--resize-timer nil)
+                                 (when (get-buffer-window panel-buffer 'visible)
                                    (panel--refresh-screen)))))))
 
 (defun panel--get-image ()
@@ -732,9 +726,9 @@ PROPERTY defaults to the full `path' used to open the file."
          (weather-code (alist-get 'weather_code current)))
     (when (and (numberp temperature) (numberp weather-code))
       (setq panel--weather-error-message nil
-            panel-temperature (format "%.1f" temperature)
-            panel-weatherdescription (panel--weather-code-to-string weather-code)
-            panel-weathericon (panel--weather-icon-from-code weather-code))
+            panel--temperature (format "%.1f" temperature)
+            panel--weather-description (panel--weather-code-to-string weather-code)
+            panel--weather-icon (panel--weather-icon-from-code weather-code))
       t)))
 
 (defun panel--decode-weather-response (status response-buffer)
@@ -797,9 +791,9 @@ VALUE is parsed JSON on success and an error message otherwise."
                                 "Missing current weather data"
                               value)))
                 (setq panel--weather-error-message "Weather unavailable"
-                      panel-temperature nil
-                      panel-weatherdescription nil
-                      panel-weathericon nil)
+                      panel--temperature nil
+                      panel--weather-description nil
+                      panel--weather-icon nil)
                 (message "Panel: Weather request failed: %s" reason)
                 (when (and active (< retry-count panel-weather-max-retries))
                   (let* ((next-retry (1+ retry-count))
@@ -871,9 +865,10 @@ RETRY-COUNT belongs to the current request chain."
   "Only refresh weather information without redrawing entire screen."
   (when-let* ((buf (get-buffer panel-buffer))
               (win (get-buffer-window buf 'visible)))
-    (with-current-buffer buf
+    ;; Select the panel window so padding math sees its dimensions.
+    (with-selected-window win
       (if (and panel--last-window-width
-               (/= (window-width win) panel--last-window-width))
+               (/= (window-width) panel--last-window-width))
           (panel--refresh-screen)
         (let ((inhibit-read-only t)
               (saved-pos (point)))
@@ -900,20 +895,18 @@ RETRY-COUNT belongs to the current request chain."
       (setq panel--weather-request nil)
       (panel--dispose-weather-request request)))
   (setq panel--weather-error-message nil
-        panel-temperature nil
-        panel-weatherdescription nil
-        panel-weathericon nil))
+        panel--temperature nil
+        panel--weather-description nil
+        panel--weather-icon nil))
 
 (defun panel--init-weather ()
   "Initialize weather fetching with cleanup."
   (panel--cleanup-weather)
   (when (panel--weather-info-p)
-    (unless (and (integerp panel-weather-update-interval)
-                 (> panel-weather-update-interval 0))
+    (unless (panel--positive-integer-p panel-weather-update-interval)
       (user-error "Weather update interval is not a positive integer: %S"
                   panel-weather-update-interval))
-    (unless (and (integerp panel-weather-request-timeout)
-                 (> panel-weather-request-timeout 0))
+    (unless (panel--positive-integer-p panel-weather-request-timeout)
       (user-error "Weather request timeout is not a positive integer: %S"
                   panel-weather-request-timeout))
     (unless (and (integerp panel-weather-max-retries)
@@ -990,20 +983,20 @@ RETRY-COUNT belongs to the current request chain."
   "Insert weather info, tagged with \\='panel-section \\='weather text property."
   (when (panel--weather-info-p)
     (let ((beg (point))
-          (icon (or panel-weathericon "")))
-      (if panel-weatherdescription
+          (icon (or panel--weather-icon "")))
+      (if panel--weather-description
           (panel--insert-text
            (if (string-empty-p icon)
                (format "%s, %s%s"
-                       (propertize panel-weatherdescription 'face 'panel-weather-description-face)
-                       (propertize panel-temperature 'face 'panel-weather-temperature-face)
+                       (propertize panel--weather-description 'face 'panel-weather-description-face)
+                       (propertize panel--temperature 'face 'panel-weather-temperature-face)
                        (propertize "℃" 'face 'panel-text-info-face))
              (format "%s %s, %s%s"
                      (if (panel--nerd-icons-available-p)
                          (propertize icon 'display '(raise 0))
                        (propertize icon 'face 'panel-weather-icon-face))
-                     (propertize panel-weatherdescription 'face 'panel-weather-description-face)
-                     (propertize panel-temperature 'face 'panel-weather-temperature-face)
+                     (propertize panel--weather-description 'face 'panel-weather-description-face)
+                     (propertize panel--temperature 'face 'panel-weather-temperature-face)
                      (propertize "℃" 'face 'panel-text-info-face))))
         (panel--insert-text
          (propertize (or panel--weather-error-message
@@ -1028,73 +1021,73 @@ RETRY-COUNT belongs to the current request chain."
        (get-buffer-window panel-buffer 'visible)))
 
 (defun panel--refresh-screen ()
-  "Show the panel screen."
+  "Refresh panel state and render it in the panel window.
+When the panel buffer is not visible, show it in the selected window."
   (panel--ensure-recentf)
-  (setq panel-recentfiles (seq-take recentf-list 9))
+  (setq panel--recent-files (seq-take recentf-list 9))
   (with-current-buffer (get-buffer-create panel-buffer)
     (unless (eq major-mode 'panel-mode)
       (panel-mode))
     (setq panel--padding-cache nil
           panel--recent-file-lines
-          (cl-loop for file in panel-recentfiles
+          (cl-loop for file in panel--recent-files
                    for index from 1
-                   collect (panel--recent-file-line file index)))
+                   collect (panel--recent-file-line file index))))
+  (if-let* ((window (get-buffer-window panel-buffer 'visible)))
+      (with-selected-window window
+        (panel--render-screen))
     (switch-to-buffer panel-buffer)
-    (let* ((image (panel--get-image))
-           (packages (format "%d" (panel--package-length))))
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (goto-char (point-min))
-        (unless (or (null panel-title)
-                    (string-empty-p panel-title))
-          (panel--insert-text (propertize panel-title 'face 'panel-title-face))
-          (insert "\n"))
-        (when image
-          (let* ((char-width (frame-char-width))
-                 (left-margin
-                  (max 0
-                       (+ (max (* panel-min-left-padding char-width)
-                               (floor
-                                (/ (- (window-body-width nil t)
-                                      (car (image-size image t)))
-                                   2)))
-                          (* panel-intro-horizontal-offset char-width)))))
-            (insert "\n")
-            (insert (propertize
-                     " "
-                     'display `(space :align-to (,left-margin))))
-            (insert-image image)
-            (insert "\n\n")))
+    (panel--render-screen)))
 
-        (when (and (not image)
-                   (panel--intro-visible-p))
-          (insert "\n\n")
-          (panel--insert-intro))
-
-        ;; (panel--insert-separator)
-        (panel--insert-recent-files)
-
+(defun panel--render-screen ()
+  "Render the panel into the selected window's buffer."
+  (let ((image (panel--get-image))
+        (packages (format "%d" (panel--package-length)))
+        (inhibit-read-only t))
+    (erase-buffer)
+    (unless (or (null panel-title)
+                (string-empty-p panel-title))
+      (panel--insert-text (propertize panel-title 'face 'panel-title-face))
+      (insert "\n"))
+    (when image
+      (let* ((char-width (frame-char-width))
+             (left-margin
+              (max 0
+                   (+ (max (* panel-min-left-padding char-width)
+                           (floor
+                            (/ (- (window-body-width nil t)
+                                  (car (image-size image t)))
+                               2)))
+                      (* panel-intro-horizontal-offset char-width)))))
         (insert "\n")
-        (panel--insert-startup-time)
-        (panel--insert-package-info packages)
-        (panel--insert-weather-info)
+        (insert (propertize
+                 " "
+                 'display `(space :align-to (,left-margin))))
+        (insert-image image)
+        (insert "\n\n")))
 
-        (insert "\n")
-        (panel--insert-centered
-         (propertize (format-time-string panel-time-format)
-                     'face 'panel-time-face))
+    (when (and (not image)
+               (panel--intro-visible-p))
+      (insert "\n\n")
+      (panel--insert-intro))
 
-        (goto-char (point-min))
-        (if (re-search-forward " \\[[1-9]\\]" nil t)
-            (beginning-of-line)
-          (goto-char (point-min)))
-        (panel--update-shortcut-highlight)))))
+    (panel--insert-recent-files)
 
-(defun panel--insert-separator ()
-  "Insert a separator line."
-  (insert "\n")
-  (panel--insert-text
-   (propertize (make-string (+ panel-path-max-length (* panel-min-left-padding 2)) ?─) 'face 'panel-separator-face)))
+    (insert "\n")
+    (panel--insert-startup-time)
+    (panel--insert-package-info packages)
+    (panel--insert-weather-info)
+
+    (insert "\n")
+    (panel--insert-centered
+     (propertize (format-time-string panel-time-format)
+                 'face 'panel-time-face))
+
+    (goto-char (point-min))
+    (if (text-property-search-forward 'panel--shortcut t t)
+        (beginning-of-line)
+      (goto-char (point-min)))
+    (panel--update-shortcut-highlight)))
 
 (provide 'panel)
 ;;; panel.el ends here
